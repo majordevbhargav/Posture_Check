@@ -30,6 +30,7 @@ Then open http://127.0.0.1:5000
 
 import os
 import json
+import msvcrt
 import subprocess
 import datetime
 from pathlib import Path
@@ -41,6 +42,11 @@ PS_SCRIPT = os.environ.get("PS_SCRIPT", "posture_agent.ps1")
 POSTURE_SERVER = os.environ.get("POSTURE_SERVER", "http://127.0.0.1:8000/api/v1/posture")
 UI_PORT = int(os.environ.get("UI_PORT", "5000"))
 
+# Written by ise_session_watcher.py — lets us show a device's MAC even
+# when the compliance check itself errors out before it gets far enough
+# to read the MAC directly off the device (e.g. a connection failure).
+IP_MAC_MAP_FILE = os.environ.get("IP_MAC_MAP_FILE", "ip_mac_map.txt")
+
 app = Flask(__name__)
 
 # In-memory results log - resets if this server restarts. Fine for a POC
@@ -48,9 +54,50 @@ app = Flask(__name__)
 RESULTS = []
 
 
+def lookup_known_mac(ip: str):
+    """Best-effort MAC lookup from the watcher's ip->mac map. Returns
+    None if the file doesn't exist or has no entry for this IP."""
+    path = Path(IP_MAC_MAP_FILE)
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if "," not in line:
+            continue
+        k, v = line.split(",", 1)
+        if k.strip() == ip:
+            return v.strip()
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Queue helpers - same file format as posture_agent.ps1 / the watcher
+#
+# ise_session_watcher.py appends to this file independently, in a
+# separate process, while this file's remove/requeue read-then-overwrite
+# the whole thing. Without locking, a watcher append landing in that
+# narrow window gets silently discarded by our overwrite - a device the
+# watcher just found would simply vanish, no error anywhere. Both this
+# file and the watcher now take the same advisory lock (byte 0 of the
+# queue file) before touching it, so their reads/writes can't interleave.
 # ---------------------------------------------------------------------------
+def _locked(path: str):
+    """Opens `path` for read/write and takes an exclusive lock on it for
+    the life of the returned handle. Creates the file first if missing,
+    since msvcrt.locking needs something to lock. Caller must close the
+    handle (which also releases the lock) when done."""
+    if not os.path.exists(path):
+        open(path, "a", encoding="utf-8").close()
+    f = open(path, "r+", encoding="utf-8")
+    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+    return f
+
+
+def _unlock_close(f):
+    f.seek(0)
+    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    f.close()
+
+
 def read_queue():
     path = Path(QUEUE_FILE)
     if not path.exists():
@@ -59,20 +106,32 @@ def read_queue():
 
 
 def remove_from_queue(ip: str):
-    items = read_queue()
-    items = [i for i in items if i != ip]
-    Path(QUEUE_FILE).write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
-    return items
+    f = _locked(QUEUE_FILE)
+    try:
+        items = [line.strip() for line in f.read().splitlines() if line.strip()]
+        items = [i for i in items if i != ip]
+        f.seek(0)
+        f.truncate()
+        f.write("\n".join(items) + ("\n" if items else ""))
+        return items
+    finally:
+        _unlock_close(f)
 
 
 def requeue(ip: str):
     """Add an IP back to the queue (e.g. after a failed check), skipping
     a duplicate if it's somehow already back in there."""
-    items = read_queue()
-    if ip not in items:
-        items.append(ip)
-    Path(QUEUE_FILE).write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
-    return items
+    f = _locked(QUEUE_FILE)
+    try:
+        items = [line.strip() for line in f.read().splitlines() if line.strip()]
+        if ip not in items:
+            items.append(ip)
+        f.seek(0)
+        f.truncate()
+        f.write("\n".join(items) + ("\n" if items else ""))
+        return items
+    finally:
+        _unlock_close(f)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +198,17 @@ def api_check():
                   "status": "ERROR", "detail": "Timed out waiting for the check to finish. Re-queued for retry."}
         RESULTS.append(entry)
         return jsonify({"result": entry, "pending": pending})
+    except Exception as e:
+        # Anything else - PowerShell not found, a permissions error, etc.
+        # Without this, the device was already removed from the queue
+        # above and would be lost for good: it's already in seen_macs.txt
+        # so the watcher would never queue it again either. Always requeue
+        # here rather than let an unexpected error make a device vanish.
+        pending = requeue(ip)
+        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "ip": ip,
+                  "status": "ERROR", "detail": f"Unexpected error running the check: {e} (re-queued for retry)"}
+        RESULTS.append(entry)
+        return jsonify({"result": entry, "pending": pending})
 
     parsed = None
     for line in proc.stdout.splitlines():
@@ -151,20 +221,27 @@ def api_check():
     if parsed is None:
         # Script didn't get far enough to emit a result line - surface
         # whatever it printed instead of failing silently, and put the
-        # IP back in the queue so it can be retried later.
+        # IP back in the queue so it can be retried later. Still try to
+        # show the MAC, via the watcher's ip->mac map, since the check
+        # never got far enough to read it directly off the device.
         pending = requeue(ip)
         detail = (proc.stderr or proc.stdout or "No output from the script.").strip()[-500:]
         entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "ip": ip,
+                  "mac": lookup_known_mac(ip),
                   "status": "ERROR", "detail": detail + " (re-queued for retry)"}
     else:
         # A connection/auth failure inside the script also reports as
-        # status "ERROR" - same treatment, back in the queue.
+        # status "ERROR" - same treatment, back in the queue. The script
+        # usually can't read the device's MAC on a connection failure
+        # (it never got that far), so fall back to the watcher's
+        # ip->mac map — ISE already told us the MAC when the session
+        # first appeared, no reason to lose it here.
         pending = requeue(ip) if parsed.get("status") == "ERROR" else read_queue()
         entry = {
             "time": datetime.datetime.now().strftime("%H:%M:%S"),
             "ip": ip,
             "computer": parsed.get("computer"),
-            "mac": parsed.get("mac"),
+            "mac": parsed.get("mac") or lookup_known_mac(ip),
             "os": parsed.get("os"),
             "status": parsed.get("status"),
             "detail": parsed.get("detail") + (" (re-queued for retry)" if parsed.get("status") == "ERROR" else ""),
@@ -230,6 +307,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
     color: var(--text);
   }
   header .meta { font-size: 12px; color: var(--muted); }
+
+  .search-bar { margin-bottom: 16px; }
+  .search-bar input {
+    width: 100%;
+    font-family: inherit;
+    background: #ffffff;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+  }
+  .search-bar input:focus { outline: none; border-color: var(--blue); }
 
   .panel {
     background: var(--panel);
@@ -325,6 +415,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   .detail { color: var(--muted); font-size: 12.5px; }
   .time { color: var(--muted); font-size: 12px; min-width: 56px; }
+  .mac {
+    font-size: 11.5px;
+    color: var(--text);
+    background: var(--gray-bg);
+    border: 1px solid var(--border);
+    padding: 2px 8px;
+    border-radius: 5px;
+    white-space: nowrap;
+  }
 
   footer { color: var(--muted); font-size: 11.5px; text-align: center; margin-top: 24px; }
 </style>
@@ -335,6 +434,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <h1>ISE Posture Console</h1>
     <div class="meta" id="server-label"></div>
   </header>
+
+  <div class="search-bar">
+    <input type="text" id="search-input" class="mono" placeholder="Filter by IP, hostname, or MAC..." autocomplete="off" />
+  </div>
 
   <div class="panel">
     <div class="panel-title">
@@ -361,10 +464,27 @@ const serverLabel = document.getElementById('server-label');
 serverLabel.textContent = 'posture server: ' + (window.__POSTURE_SERVER__ || '');
 
 let formOpenFor = null; // ip of the currently open cred-form, or null
+let searchTerm = '';    // lowercased, updated as the user types
+let currentPending = [];
+let currentResults = [];
 
 async function fetchJSON(url, opts) {
   const res = await fetch(url, opts);
   return res.json();
+}
+
+function applyPendingFilter(list) {
+  if (!searchTerm) return list;
+  return list.filter(ip => ip.toLowerCase().includes(searchTerm));
+}
+
+function applyResultsFilter(list) {
+  if (!searchTerm) return list;
+  return list.filter(r =>
+    (r.ip || '').toLowerCase().includes(searchTerm) ||
+    (r.computer || '').toLowerCase().includes(searchTerm) ||
+    (r.mac || '').toLowerCase().includes(searchTerm)
+  );
 }
 
 function rowTemplate(ip) {
@@ -411,15 +531,19 @@ function renderResults(results) {
     const badgeClass = 'status-' + (r.status || 'ERROR');
     const detailBits = [];
     if (r.computer) detailBits.push(r.computer);
-    if (r.mac) detailBits.push(r.mac);
     if (r.detail) detailBits.push(r.detail);
     if (r.submitted === false) detailBits.push('(not submitted to ISE: ' + (r.submitError || 'unknown error') + ')');
+    const needsMac = (r.status === 'ERROR' || r.status === 'NON-COMPLIANT');
+    const macBadge = needsMac
+      ? `<span class="mac mono">MAC: ${r.mac || 'unknown'}</span>`
+      : (r.mac ? `<span class="mac mono">MAC: ${r.mac}</span>` : '');
     const row = document.createElement('div');
     row.className = 'row';
     row.innerHTML = `
       <span class="time">${r.time}</span>
       <span class="ip mono">${r.ip}</span>
       <span class="status-badge ${badgeClass}">${r.status || 'ERROR'}</span>
+      ${macBadge}
       <span class="detail">${detailBits.join(' &middot; ')}</span>
     `;
     list.appendChild(row);
@@ -427,14 +551,16 @@ function renderResults(results) {
 }
 
 async function refreshQueue() {
-  if (formOpenFor) return; // don't rebuild the list out from under an open form
   const data = await fetchJSON('/api/queue');
-  renderQueue(data.pending);
+  currentPending = data.pending;
+  if (formOpenFor) return; // don't rebuild the list out from under an open form
+  renderQueue(applyPendingFilter(currentPending));
 }
 
 async function refreshResults() {
   const data = await fetchJSON('/api/results');
-  renderResults(data.results);
+  currentResults = data.results;
+  renderResults(applyResultsFilter(currentResults));
 }
 
 document.addEventListener('click', async (e) => {
@@ -461,7 +587,8 @@ document.addEventListener('click', async (e) => {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ip})
     });
-    renderQueue(data.pending);
+    currentPending = data.pending;
+    renderQueue(applyPendingFilter(currentPending));
     refreshResults();
   }
 
@@ -478,9 +605,16 @@ document.addEventListener('click', async (e) => {
       body: JSON.stringify({ip, username, password})
     });
     formOpenFor = null;
-    renderQueue(data.pending);
+    currentPending = data.pending;
+    renderQueue(applyPendingFilter(currentPending));
     refreshResults();
   }
+});
+
+document.getElementById('search-input').addEventListener('input', (e) => {
+  searchTerm = e.target.value.trim().toLowerCase();
+  if (!formOpenFor) renderQueue(applyPendingFilter(currentPending));
+  renderResults(applyResultsFilter(currentResults));
 });
 
 refreshQueue();

@@ -133,21 +133,39 @@ try {
         $CimParams = @{ CimSession = $Session }
     }
 
-    $OS = Get-CimInstance @CimParams -ClassName Win32_OperatingSystem
-    $Nic = Get-CimInstance @CimParams -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" |
-           Where-Object { $_.DefaultIPGateway } | Select-Object -First 1
-    if (-not $Nic) {
-        $Nic = Get-CimInstance @CimParams -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Select-Object -First 1
-    }
+    try {
+        $OS = Get-CimInstance @CimParams -ClassName Win32_OperatingSystem
+        $Nic = Get-CimInstance @CimParams -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" |
+               Where-Object { $_.DefaultIPGateway } | Select-Object -First 1
+        if (-not $Nic) {
+            $Nic = Get-CimInstance @CimParams -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Select-Object -First 1
+        }
 
-    $FwDisabled = Get-CimInstance @CimParams -Namespace ROOT\StandardCimv2 -ClassName MSFT_NetFirewallProfile |
-                  Where-Object { -not $_.Enabled }
-    $Compliant = $FwDisabled.Count -eq 0
-    $Status = if ($Compliant) { "COMPLIANT" } else { "NON-COMPLIANT" }
-    $Detail = if ($Compliant) {
-        "All firewall profiles enabled"
-    } else {
-        "Disabled: " + (($FwDisabled | Select-Object -ExpandProperty Name) -join ", ")
+        $FwDisabled = Get-CimInstance @CimParams -Namespace ROOT\StandardCimv2 -ClassName MSFT_NetFirewallProfile |
+                      Where-Object { -not $_.Enabled }
+        $Compliant = $FwDisabled.Count -eq 0
+        $Status = if ($Compliant) { "COMPLIANT" } else { "NON-COMPLIANT" }
+        $Detail = if ($Compliant) {
+            "All firewall profiles enabled"
+        } else {
+            "Disabled: " + (($FwDisabled | Select-Object -ExpandProperty Name) -join ", ")
+        }
+    } catch {
+        # Connected fine, but the actual query failed (e.g. some machines
+        # don't expose MSFT_NetFirewallProfile cleanly over a DCOM
+        # CimSession even though the connection itself succeeded). Without
+        # this catch, the script used to die here with no RESULT_JSON line
+        # at all, which just meant an endless silent requeue loop.
+        Write-Host "ERROR querying $ComputerName after connecting: $($_.Exception.Message)" -ForegroundColor Red
+        $FailResult = [ordered]@{
+            computer  = $ComputerName
+            compliant = $null
+            status    = "ERROR"
+            detail    = "Connected, but the posture query itself failed: $($_.Exception.Message)"
+            submitted = $false
+        }
+        Write-Output ("RESULT_JSON:" + ($FailResult | ConvertTo-Json -Compress))
+        exit 1
     }
 }
 finally {

@@ -23,10 +23,19 @@ Run (same env vars as posture_app.py):
     set ISE_USER=Dev
     set ISE_PASS=Login@123
     python ise_session_watcher.py
+
+Two files get created next to this script:
+    pending_devices.txt   what's waiting to be checked (drained by
+                           posture_agent.ps1 / posture_ui.py)
+    seen_macs.txt          every MAC ever queued, so a restart doesn't
+                           re-queue devices that were already handled.
+                           Delete a MAC's line from this file (or the
+                           whole file) to force it to be queued again.
 """
 
 import os
 import time
+import msvcrt
 import logging
 from xml.etree import ElementTree
 
@@ -54,19 +63,90 @@ POLL_INTERVAL_SECONDS = int(os.environ.get("WATCHER_POLL_SECONDS", "20"))
 # path from both the watcher and the PS1 (same folder by default).
 QUEUE_FILE = os.environ.get("PENDING_QUEUE_FILE", "pending_devices.txt")
 
+# Persists which MACs have EVER been enqueued, across restarts of this
+# script. Without this, restarting the watcher re-treats every currently
+# active session as "new" and re-queues everyone all over again — which
+# is exactly why pending_devices.txt had the same handful of IPs
+# repeated many times over. A MAC is only ever enqueued once; deleting
+# this file (or a MAC's line from it) is how you force a re-check.
+SEEN_MACS_FILE = os.environ.get("SEEN_MACS_FILE", "seen_macs.txt")
+
+# Simple IP -> MAC lookup, written every time we see a session with a
+# usable IP. This exists so posture_ui.py can still show a device's MAC
+# on an ERROR result — the compliance check itself may fail before it
+# gets far enough to read the MAC directly off the device, but ISE
+# already told us the MAC the moment the session appeared, so there's
+# no reason for that information to get lost.
+IP_MAC_MAP_FILE = os.environ.get("IP_MAC_MAP_FILE", "ip_mac_map.txt")
+
 AUTH = HTTPBasicAuth(ISE_USER, ISE_PASS)
 ACTIVE_LIST_URL = f"{ISE_HOST.rstrip('/')}/admin/API/mnt/Session/ActiveList"
 
 
-def enqueue(ip: str) -> None:
-    """Append one IP to the shared queue file for posture_agent.ps1 to
-    pick up. Simple append - PowerShell side removes lines once it has
-    claimed them, so this file is always just 'what's still pending'."""
-    if not ip or ip == "unknown-ip":
-        log.warning("Skipping enqueue - no usable IP for this session.")
+def load_seen_macs() -> set:
+    if not os.path.exists(SEEN_MACS_FILE):
+        return set()
+    with open(SEEN_MACS_FILE, "r", encoding="utf-8") as f:
+        return {line.strip().upper() for line in f if line.strip()}
+
+
+def save_seen_macs(seen_macs: set) -> None:
+    with open(SEEN_MACS_FILE, "w", encoding="utf-8") as f:
+        for mac in sorted(seen_macs):
+            f.write(f"{mac}\n")
+
+
+def record_ip_mac(ip: str, mac: str) -> None:
+    """Keeps a simple ip -> MAC lookup file up to date. Rewrites the
+    whole file each call — fine at the scale this project runs at."""
+    if not ip or ip == "unknown-ip" or not mac:
         return
-    with open(QUEUE_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{ip}\n")
+    mapping = {}
+    if os.path.exists(IP_MAC_MAP_FILE):
+        with open(IP_MAC_MAP_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                if "," in line:
+                    k, v = line.strip().split(",", 1)
+                    mapping[k] = v
+    mapping[ip] = mac
+    with open(IP_MAC_MAP_FILE, "w", encoding="utf-8") as f:
+        for k, v in mapping.items():
+            f.write(f"{k},{v}\n")
+
+
+def enqueue(ip: str) -> bool:
+    """Append one IP to the shared queue file for posture_agent.ps1 to
+    pick up. Returns True if the IP is now queued (or already was),
+    False if there was nothing usable to queue yet (e.g. no IP assigned
+    to the session yet). The caller uses this return value to decide
+    whether the owning MAC should be marked 'seen' — a MAC with no IP
+    yet must NOT be marked seen, or it'll never get a second chance
+    once its IP does show up on a later poll.
+
+    Takes the same advisory lock (byte 0 of the queue file) that
+    posture_ui.py uses for its own read-modify-write on this file —
+    without it, an append here landing in the middle of the UI's
+    read-then-overwrite could get silently discarded."""
+    if not ip or ip == "unknown-ip":
+        log.warning("Skipping enqueue - no usable IP for this session yet (will retry next poll).")
+        return False
+
+    if not os.path.exists(QUEUE_FILE):
+        open(QUEUE_FILE, "a", encoding="utf-8").close()
+
+    with open(QUEUE_FILE, "r+", encoding="utf-8") as f:
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            existing = {line.strip() for line in f.read().splitlines() if line.strip()}
+            if ip in existing:
+                log.debug("Skipping enqueue - %s is already waiting in the queue.", ip)
+                return True
+            f.seek(0, os.SEEK_END)
+            f.write(f"{ip}\n")
+            return True
+        finally:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def fetch_active_sessions() -> dict:
@@ -113,19 +193,34 @@ def main():
         ISE_HOST, POLL_INTERVAL_SECONDS,
     )
 
-    # Prime the baseline on first run. These are logged too (not just
-    # counted), so you can see who's already connected — they're still
-    # excluded from the "NEW SESSION" alerts below since they were
-    # already there before the watcher started.
-    seen_macs = set()
+    # Loaded from disk, not just this run's memory — this is what
+    # prevents a restart from re-queuing devices that were already
+    # queued (and possibly already checked) before.
+    seen_macs = load_seen_macs()
+    log.info("Loaded %d previously-seen MAC(s) from %s", len(seen_macs), SEEN_MACS_FILE)
+
     try:
         baseline = fetch_active_sessions()
-        seen_macs = set(baseline.keys())
-        log.info("Baseline: %d session(s) already active:", len(seen_macs))
+        already_seen = set(baseline.keys()) & seen_macs
+        new_in_baseline = set(baseline.keys()) - seen_macs
+        log.info(
+            "Baseline: %d session(s) active (%d already seen before, %d new)",
+            len(baseline), len(already_seen), len(new_in_baseline),
+        )
+        confirmed = set()
         for mac, fields in baseline.items():
             ip, hostname = describe(fields)
-            log.info("  ALREADY ACTIVE  MAC=%s  IP=%s  host=%s", mac, ip, hostname or "?")
-            enqueue(ip)
+            record_ip_mac(ip, mac)
+            if mac in already_seen:
+                log.info("  ALREADY SEEN    MAC=%s  IP=%s  host=%s  (not re-queued)", mac, ip, hostname or "?")
+                continue
+            log.info("  NEW (baseline)  MAC=%s  IP=%s  host=%s", mac, ip, hostname or "?")
+            if enqueue(ip):
+                confirmed.add(mac)
+            # else: no IP yet - deliberately NOT added to seen_macs, so
+            # it's picked up again on the next poll once an IP appears.
+        seen_macs |= confirmed
+        save_seen_macs(seen_macs)
     except requests.HTTPError as e:
         log.error("Could not fetch initial session list: %s", e)
     except Exception as e:
@@ -143,17 +238,22 @@ def main():
             continue
 
         new_macs = set(current.keys()) - seen_macs
+        confirmed = set()
         for mac in new_macs:
             ip, hostname = describe(current[mac])
+            record_ip_mac(ip, mac)
             log.info("NEW SESSION  MAC=%s  IP=%s  host=%s", mac, ip, hostname or "?")
-            enqueue(ip)
+            if enqueue(ip):
+                confirmed.add(mac)
+            # else: no IP yet - stays out of seen_macs, retried next poll.
 
         # Also worth knowing about, though not the focus right now:
         dropped_macs = seen_macs - set(current.keys())
         for mac in dropped_macs:
             log.info("SESSION ENDED  MAC=%s", mac)
 
-        seen_macs = set(current.keys())
+        seen_macs |= confirmed
+        save_seen_macs(seen_macs)
 
 
 if __name__ == "__main__":

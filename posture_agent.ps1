@@ -32,7 +32,11 @@ param(
     [securestring]$Password,
     # Only for non-interactive callers (e.g. the web UI) that can't supply
     # a SecureString. Prefer -Password for interactive/manual use.
-    [string]$PlainPassword
+    [string]$PlainPassword,
+    # The common stored credential from Save-PostureCredential.ps1. Used
+    # automatically when none of Username/Password/PlainPassword are
+    # given — pass any of those three to override it for one device.
+    [string]$CommonCredPath = "$PSScriptRoot\posture_common_cred.xml"
 )
 
 $ErrorActionPreference = "Stop"
@@ -76,6 +80,36 @@ $Session = $null
 $Cred = $null
 
 function Get-PostureCred {
+    # Any explicit credential info passed in is an override — use it
+    # instead of the common stored one, no matter what.
+    $HasExplicitOverride = [bool]($Username -or $Password -or $PlainPassword)
+
+    if (-not $HasExplicitOverride -and (Test-Path $CommonCredPath)) {
+        try {
+            $Stored = Import-Clixml -Path $CommonCredPath
+            $StoredUser = $Stored.UserName
+
+            # The manual-entry path below always qualifies the username as
+            # ComputerName\User before using it - that's what lets Windows
+            # correctly resolve it as a LOCAL account on the target instead
+            # of an ambiguous one. The stored credential skipped that step
+            # entirely, using whatever was typed into Get-Credential
+            # verbatim. If that was saved unqualified (e.g. just
+            # "Administrator"), it silently fails here while the same
+            # account typed manually - which DOES get qualified - works.
+            # That's exactly this bug.
+            if ($StoredUser -notmatch '\\') {
+                $QualifiedStoredUser = "$ComputerName\$StoredUser"
+                $Stored = New-Object System.Management.Automation.PSCredential($QualifiedStoredUser, $Stored.Password)
+            }
+
+            Write-Host "Using stored common credential ($($Stored.UserName)) for $ComputerName" -ForegroundColor DarkGray
+            return $Stored
+        } catch {
+            Write-Host "Could not load stored credential from $CommonCredPath ($($_.Exception.Message)) - falling back to prompt." -ForegroundColor Yellow
+        }
+    }
+
     if (-not $Username) { $script:Username = Read-Host "Username on $ComputerName (e.g. Administrator)" }
     if ($PlainPassword) {
         # Built directly via the .NET class instead of ConvertTo-SecureString,

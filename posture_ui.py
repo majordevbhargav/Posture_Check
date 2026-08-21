@@ -172,11 +172,15 @@ def api_skip():
 def api_check():
     data = request.get_json(force=True)
     ip = data.get("ip", "").strip()
+    # Both optional now — omitted means "use the stored common credential",
+    # which posture_agent.ps1 loads automatically. Only passed through as
+    # an explicit override when the UI's "different credentials" form was
+    # actually used for this device.
     username = data.get("username", "").strip()
     password = data.get("password", "")
 
-    if not ip or not username or not password:
-        return jsonify({"error": "ip, username, and password are all required"}), 400
+    if not ip:
+        return jsonify({"error": "ip is required"}), 400
 
     # Consider it claimed the moment a check starts, same as the CLI does.
     remove_from_queue(ip)
@@ -185,10 +189,10 @@ def api_check():
         "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-File", PS_SCRIPT,
         "-ComputerName", ip,
-        "-Username", username,
-        "-PlainPassword", password,
         "-PostureServer", POSTURE_SERVER,
     ]
+    if username and password:
+        cmd += ["-Username", username, "-PlainPassword", password]
 
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
@@ -372,6 +376,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   button:hover { border-color: #c9ccd1; background: var(--gray-bg); }
   button.skip:hover { border-color: var(--red); color: var(--red); background: var(--red-bg); }
   button.run:hover { border-color: var(--blue); color: var(--blue); }
+  button.override-link { border-color: transparent; background: transparent; color: var(--muted); font-size: 12px; text-decoration: underline; padding: 4px 4px; }
+  button.override-link:hover { color: var(--text); }
   button.confirm { background: var(--text); border-color: var(--text); color: #fff; }
   button.confirm:hover { opacity: 0.85; background: var(--text); color: #fff; }
   button.cancel { border-color: transparent; color: var(--muted); }
@@ -487,22 +493,33 @@ function applyResultsFilter(list) {
   );
 }
 
+function esc(s) {
+  // Basic HTML-escaping for anything interpolated into innerHTML below.
+  // These values come from ISE's own session data / the check scripts,
+  // not directly from an attacker, but there's no reason to skip this.
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
 function rowTemplate(ip) {
+  const safeIp = esc(ip);
   const div = document.createElement('div');
   div.className = 'device';
   div.innerHTML = `
     <div class="row">
       <span class="dot"></span>
-      <span class="ip mono">${ip}</span>
+      <span class="ip mono">${safeIp}</span>
       <span class="spacer"></span>
-      <button class="run" data-ip="${ip}">Run</button>
-      <button class="skip" data-ip="${ip}">Skip</button>
+      <button class="run" data-ip="${safeIp}">Run</button>
+      <button class="override-link" data-ip="${safeIp}">different creds?</button>
+      <button class="skip" data-ip="${safeIp}">Skip</button>
     </div>
-    <div class="cred-form" data-ip="${ip}">
+    <div class="cred-form" data-ip="${safeIp}">
       <input type="text" class="username" placeholder="Username (e.g. Administrator)" />
       <input type="password" class="password" placeholder="Password" />
-      <button class="confirm" data-ip="${ip}">Confirm &#9656;</button>
-      <button class="cancel" data-ip="${ip}">Cancel</button>
+      <button class="confirm" data-ip="${safeIp}">Confirm &#9656;</button>
+      <button class="cancel" data-ip="${safeIp}">Cancel</button>
     </div>
   `;
   return div;
@@ -528,21 +545,21 @@ function renderResults(results) {
   }
   list.innerHTML = '';
   results.forEach(r => {
-    const badgeClass = 'status-' + (r.status || 'ERROR');
+    const badgeClass = 'status-' + esc(r.status || 'ERROR');
     const detailBits = [];
-    if (r.computer) detailBits.push(r.computer);
-    if (r.detail) detailBits.push(r.detail);
-    if (r.submitted === false) detailBits.push('(not submitted to ISE: ' + (r.submitError || 'unknown error') + ')');
+    if (r.computer) detailBits.push(esc(r.computer));
+    if (r.detail) detailBits.push(esc(r.detail));
+    if (r.submitted === false) detailBits.push('(not submitted to ISE: ' + esc(r.submitError || 'unknown error') + ')');
     const needsMac = (r.status === 'ERROR' || r.status === 'NON-COMPLIANT');
     const macBadge = needsMac
-      ? `<span class="mac mono">MAC: ${r.mac || 'unknown'}</span>`
-      : (r.mac ? `<span class="mac mono">MAC: ${r.mac}</span>` : '');
+      ? `<span class="mac mono">MAC: ${esc(r.mac || 'unknown')}</span>`
+      : (r.mac ? `<span class="mac mono">MAC: ${esc(r.mac)}</span>` : '');
     const row = document.createElement('div');
     row.className = 'row';
     row.innerHTML = `
-      <span class="time">${r.time}</span>
-      <span class="ip mono">${r.ip}</span>
-      <span class="status-badge ${badgeClass}">${r.status || 'ERROR'}</span>
+      <span class="time">${esc(r.time)}</span>
+      <span class="ip mono">${esc(r.ip)}</span>
+      <span class="status-badge ${badgeClass}">${esc(r.status || 'ERROR')}</span>
       ${macBadge}
       <span class="detail">${detailBits.join(' &middot; ')}</span>
     `;
@@ -568,6 +585,21 @@ document.addEventListener('click', async (e) => {
   if (!ip) return;
 
   if (e.target.classList.contains('run')) {
+    // One click, no form: runs immediately using the stored common
+    // credential (posture_agent.ps1 loads it automatically).
+    e.target.disabled = true;
+    e.target.textContent = 'Running...';
+    const data = await fetchJSON('/api/check', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ip})
+    });
+    currentPending = data.pending;
+    renderQueue(applyPendingFilter(currentPending));
+    refreshResults();
+  }
+
+  if (e.target.classList.contains('override-link')) {
     document.querySelectorAll('.cred-form').forEach(f => f.classList.remove('open'));
     const form = document.querySelector(`.cred-form[data-ip="${ip}"]`);
     form.classList.add('open');
@@ -593,6 +625,7 @@ document.addEventListener('click', async (e) => {
   }
 
   if (e.target.classList.contains('confirm')) {
+    // The override path — only used when "different creds?" was clicked.
     const form = document.querySelector(`.cred-form[data-ip="${ip}"]`);
     const username = form.querySelector('.username').value.trim();
     const password = form.querySelector('.password').value;

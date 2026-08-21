@@ -1,0 +1,13 @@
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">
+  <Obj RefId="0">
+    <TN RefId="0">
+      <T>System.Management.Automation.PSCredential</T>
+      <T>System.Object</T>
+    </TN>
+    <ToString>System.Management.Automation.PSCredential</ToString>
+    <Props>
+      <S N="UserName">administrator</S>
+      <SS N="Password">01000000d08c9ddf0115d1118c7a00c04fc297eb01000000d9b2d425a353494fbf2d5b99dd4ee2190000000002000000000010660000000100002000000078e83ce2dd379c81e2405471c5633a2649c15b7adc0dbb01763a37137f225b70000000000e8000000002000020000000a9be313353c00d6a1903b5773d7b326ec73991fc901cb24a1d98a81fb1943e84200000008c4523d19c69252819cdcadd6c60261ee3a305d01c84bc145fdefa6b2c6aa1f640000000b85afb190ca8c7c34af5790d5b90f86f3a6a790181ec70ef6558a84dfd591977dbd55b95eaf3201dbde6fc3b6828d41bc76c6429c8beb3bf5c8bb469fa65e194</SS>
+    </Props>
+  </Obj>
+</Objs>

@@ -91,15 +91,30 @@ function Get-PostureCred {
 
             # The manual-entry path below always qualifies the username as
             # ComputerName\User before using it - that's what lets Windows
-            # correctly resolve it as a LOCAL account on the target instead
-            # of an ambiguous one. The stored credential skipped that step
-            # entirely, using whatever was typed into Get-Credential
-            # verbatim. If that was saved unqualified (e.g. just
-            # "Administrator"), it silently fails here while the same
-            # account typed manually - which DOES get qualified - works.
-            # That's exactly this bug.
-            if ($StoredUser -notmatch '\\') {
-                $QualifiedStoredUser = "$ComputerName\$StoredUser"
+            # correctly resolve it as a LOCAL account ON THE TARGET, rather
+            # than an ambiguous or (worse) wrongly-scoped one. A stored
+            # credential can be wrongly-scoped in three ways, all of which
+            # need re-qualifying to the CURRENT target here:
+            #   - no prefix at all:      "Administrator"
+            #   - ".\" (means THIS machine, i.e. wherever the script is
+            #     currently running - your laptop, not the target):
+            #                            ".\Administrator"
+            #   - your own machine's literal name (same meaning as ".\",
+            #     just spelled out):     "YOUR-LAPTOP\Administrator"
+            # Any of these three, used as-is against a remote target, is
+            # either ambiguous or points at the wrong machine entirely -
+            # which looks exactly like "manual entry works, stored doesn't".
+            $BareUser = $StoredUser
+            $Prefix = $null
+            if ($StoredUser -match '\\') {
+                $Parts = $StoredUser -split '\\', 2
+                $Prefix = $Parts[0]
+                $BareUser = $Parts[1]
+            }
+            $NeedsRequalify = (-not $Prefix) -or ($Prefix -eq '.') -or ($Prefix -ieq $env:COMPUTERNAME)
+
+            if ($NeedsRequalify) {
+                $QualifiedStoredUser = "$ComputerName\$BareUser"
                 $Stored = New-Object System.Management.Automation.PSCredential($QualifiedStoredUser, $Stored.Password)
             }
 

@@ -1,20 +1,23 @@
 """
-Posture Console — web UI for the posture-check workflow, so you don't
-have to type commands in a terminal each time.
+Posture Console — web UI for the posture-check workflow.
 
-Reads/writes the same pending_devices.txt queue that
-ise_session_watcher.py fills and posture_agent.ps1 drains, and runs
-posture_agent.ps1 for you when you click "Run" on a device, prompting
-for username/password right there on the page instead of the console.
+New devices from ise_session_watcher.py's queue are now checked
+AUTOMATICALLY in the background, using the stored common credential -
+no click needed. A device only shows up in this page's "Needs
+attention" list if its check actually failed, at which point you can
+Retry (same stored credential), use different credentials for just
+that device, or Skip it. Compliant and non-compliant results go
+straight into the results log either way.
 
 SECURITY NOTE (read before using outside a local POC): the password you
-type in the browser is sent to this server in plaintext (fine over
-localhost HTTP for testing) and passed to PowerShell as a command-line
-argument, which is briefly visible to anything inspecting the process
-list while the check runs. That's an acceptable tradeoff for a local
-POC, not for a shared/production deployment — before then, swap this
-for a proper secret store (Windows Credential Manager, DPAPI, a vault)
-rather than passing plaintext around.
+type in the browser (for a "different creds?" override) is sent to
+this server in plaintext (fine over localhost HTTP for testing) and
+passed to PowerShell as a command-line argument, which is briefly
+visible to anything inspecting the process list while the check runs.
+That's an acceptable tradeoff for a local POC, not for a shared/
+production deployment — before then, swap this for a proper secret
+store (Windows Credential Manager, DPAPI, a vault) rather than passing
+plaintext around.
 
 Install deps:
     pip install flask --break-system-packages
@@ -30,7 +33,9 @@ Then open http://127.0.0.1:5000
 
 import os
 import json
+import time
 import msvcrt
+import threading
 import subprocess
 import datetime
 from pathlib import Path
@@ -41,6 +46,7 @@ QUEUE_FILE = os.environ.get("PENDING_QUEUE_FILE", "pending_devices.txt")
 PS_SCRIPT = os.environ.get("PS_SCRIPT", "posture_agent.ps1")
 POSTURE_SERVER = os.environ.get("POSTURE_SERVER", "http://127.0.0.1:8000/api/v1/posture")
 UI_PORT = int(os.environ.get("UI_PORT", "5000"))
+AUTO_WORKER_POLL_SECONDS = float(os.environ.get("AUTO_WORKER_POLL_SECONDS", "3"))
 
 # Written by ise_session_watcher.py — lets us show a device's MAC even
 # when the compliance check itself errors out before it gets far enough
@@ -52,6 +58,17 @@ app = Flask(__name__)
 # In-memory results log - resets if this server restarts. Fine for a POC
 # console; swap for a real store if you need history to survive restarts.
 RESULTS = []
+
+# Devices that failed a check and need a human to look at them - either
+# retry (same stored credential), retry with different credentials, or
+# skip. This is deliberately SEPARATE from the watcher's queue file:
+# devices land here only after failing once, and the auto-worker below
+# never touches this list, so a broken device doesn't get silently
+# retried forever in a loop - it waits for you.
+NEEDS_ATTENTION = []
+STATE_LOCK = threading.Lock()  # guards RESULTS and NEEDS_ATTENTION, shared
+                                # between Flask request threads and the
+                                # background auto-worker thread
 
 
 def lookup_known_mac(ip: str):
@@ -119,8 +136,11 @@ def remove_from_queue(ip: str):
 
 
 def requeue(ip: str):
-    """Add an IP back to the queue (e.g. after a failed check), skipping
-    a duplicate if it's somehow already back in there."""
+    """Add an IP back to the SHARED FILE queue - only used for genuine
+    infrastructure failures (timeout, PowerShell itself not runnable)
+    where retrying automatically still makes sense. A real check
+    failure (bad creds, connection refused, etc.) goes to
+    NEEDS_ATTENTION instead - see add_needs_attention()."""
     f = _locked(QUEUE_FILE)
     try:
         items = [line.strip() for line in f.read().splitlines() if line.strip()]
@@ -134,6 +154,30 @@ def requeue(ip: str):
         _unlock_close(f)
 
 
+def add_needs_attention(ip: str):
+    with STATE_LOCK:
+        if ip not in NEEDS_ATTENTION:
+            NEEDS_ATTENTION.append(ip)
+        return list(NEEDS_ATTENTION)
+
+
+def remove_needs_attention(ip: str):
+    with STATE_LOCK:
+        if ip in NEEDS_ATTENTION:
+            NEEDS_ATTENTION.remove(ip)
+        return list(NEEDS_ATTENTION)
+
+
+def get_needs_attention():
+    with STATE_LOCK:
+        return list(NEEDS_ATTENTION)
+
+
+def append_result(entry: dict):
+    with STATE_LOCK:
+        RESULTS.append(entry)
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -142,9 +186,96 @@ def index():
     return Response(INDEX_HTML, mimetype="text/html")
 
 
-@app.route("/api/queue")
-def api_queue():
-    return jsonify({"pending": read_queue()})
+def run_check(ip: str, username: str = None, password: str = None) -> dict:
+    """Runs posture_agent.ps1 against one IP and returns the result entry
+    (also appending it to RESULTS). On success (COMPLIANT/NON-COMPLIANT),
+    that's the end of it. On any failure, the IP goes into
+    NEEDS_ATTENTION so a human decides what happens next, rather than
+    being retried automatically forever."""
+    cmd = [
+        "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", PS_SCRIPT,
+        "-ComputerName", ip,
+        "-PostureServer", POSTURE_SERVER,
+    ]
+    if username and password:
+        cmd += ["-Username", username, "-PlainPassword", password]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        add_needs_attention(ip)
+        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "ip": ip,
+                  "mac": lookup_known_mac(ip), "status": "ERROR",
+                  "detail": "Timed out waiting for the check to finish."}
+        append_result(entry)
+        return entry
+    except Exception as e:
+        # PowerShell itself not runnable, permissions error, etc.
+        add_needs_attention(ip)
+        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "ip": ip,
+                  "mac": lookup_known_mac(ip), "status": "ERROR",
+                  "detail": f"Unexpected error running the check: {e}"}
+        append_result(entry)
+        return entry
+
+    parsed = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("RESULT_JSON:"):
+            try:
+                parsed = json.loads(line[len("RESULT_JSON:"):])
+            except json.JSONDecodeError:
+                parsed = None
+
+    if parsed is None:
+        # Script didn't get far enough to emit a result line - surface
+        # whatever it printed instead of failing silently.
+        add_needs_attention(ip)
+        detail = (proc.stderr or proc.stdout or "No output from the script.").strip()[-500:]
+        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "ip": ip,
+                  "mac": lookup_known_mac(ip), "status": "ERROR", "detail": detail}
+    else:
+        is_error = parsed.get("status") == "ERROR"
+        if is_error:
+            add_needs_attention(ip)
+        entry = {
+            "time": datetime.datetime.now().strftime("%H:%M:%S"),
+            "ip": ip,
+            "computer": parsed.get("computer"),
+            "mac": parsed.get("mac") or lookup_known_mac(ip),
+            "os": parsed.get("os"),
+            "status": parsed.get("status"),
+            "detail": parsed.get("detail"),
+            "submitted": parsed.get("submitted"),
+            "submitError": parsed.get("submitError"),
+        }
+
+    append_result(entry)
+    return entry
+
+
+def auto_worker():
+    """Background loop: drains the watcher's queue file automatically,
+    running each device with the stored common credential - no click
+    needed. Only failures ever reach the UI (via NEEDS_ATTENTION)."""
+    while True:
+        try:
+            pending = read_queue()
+            if pending:
+                ip = pending[0]
+                remove_from_queue(ip)
+                run_check(ip)
+        except Exception:
+            # Never let the background loop die - a bad iteration just
+            # gets logged implicitly via the next poll's result, and the
+            # loop keeps going.
+            pass
+        time.sleep(AUTO_WORKER_POLL_SECONDS)
+
+
+@app.route("/api/needs_attention")
+def api_needs_attention():
+    return jsonify({"needs_attention": get_needs_attention()})
 
 
 @app.route("/api/results")
@@ -158,103 +289,37 @@ def api_skip():
     ip = data.get("ip", "").strip()
     if not ip:
         return jsonify({"error": "ip is required"}), 400
-    pending = remove_from_queue(ip)
-    RESULTS.append({
+    remaining = remove_needs_attention(ip)
+    append_result({
         "time": datetime.datetime.now().strftime("%H:%M:%S"),
         "ip": ip,
         "status": "SKIPPED",
-        "detail": "Skipped from the queue, not checked.",
+        "detail": "Skipped - not checked.",
     })
-    return jsonify({"pending": pending})
+    return jsonify({"needs_attention": remaining})
 
 
 @app.route("/api/check", methods=["POST"])
 def api_check():
+    """Manual (re)run from the UI - either the plain "Run" retry (no
+    creds passed -> stored common credential is used) or the "different
+    creds?" override (both passed)."""
     data = request.get_json(force=True)
     ip = data.get("ip", "").strip()
-    # Both optional now — omitted means "use the stored common credential",
-    # which posture_agent.ps1 loads automatically. Only passed through as
-    # an explicit override when the UI's "different credentials" form was
-    # actually used for this device.
     username = data.get("username", "").strip()
     password = data.get("password", "")
 
     if not ip:
         return jsonify({"error": "ip is required"}), 400
 
-    # Consider it claimed the moment a check starts, same as the CLI does.
-    remove_from_queue(ip)
+    # It's being handled right now either way - clear it first so a
+    # renewed failure below adds it back cleanly rather than being a
+    # silent no-op against an item already in the list.
+    remove_needs_attention(ip)
 
-    cmd = [
-        "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-        "-File", PS_SCRIPT,
-        "-ComputerName", ip,
-        "-PostureServer", POSTURE_SERVER,
-    ]
-    if username and password:
-        cmd += ["-Username", username, "-PlainPassword", password]
+    run_check(ip, username or None, password or None)
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-    except subprocess.TimeoutExpired:
-        pending = requeue(ip)
-        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "ip": ip,
-                  "status": "ERROR", "detail": "Timed out waiting for the check to finish. Re-queued for retry."}
-        RESULTS.append(entry)
-        return jsonify({"result": entry, "pending": pending})
-    except Exception as e:
-        # Anything else - PowerShell not found, a permissions error, etc.
-        # Without this, the device was already removed from the queue
-        # above and would be lost for good: it's already in seen_macs.txt
-        # so the watcher would never queue it again either. Always requeue
-        # here rather than let an unexpected error make a device vanish.
-        pending = requeue(ip)
-        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "ip": ip,
-                  "status": "ERROR", "detail": f"Unexpected error running the check: {e} (re-queued for retry)"}
-        RESULTS.append(entry)
-        return jsonify({"result": entry, "pending": pending})
-
-    parsed = None
-    for line in proc.stdout.splitlines():
-        if line.startswith("RESULT_JSON:"):
-            try:
-                parsed = json.loads(line[len("RESULT_JSON:"):])
-            except json.JSONDecodeError:
-                parsed = None
-
-    if parsed is None:
-        # Script didn't get far enough to emit a result line - surface
-        # whatever it printed instead of failing silently, and put the
-        # IP back in the queue so it can be retried later. Still try to
-        # show the MAC, via the watcher's ip->mac map, since the check
-        # never got far enough to read it directly off the device.
-        pending = requeue(ip)
-        detail = (proc.stderr or proc.stdout or "No output from the script.").strip()[-500:]
-        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "ip": ip,
-                  "mac": lookup_known_mac(ip),
-                  "status": "ERROR", "detail": detail + " (re-queued for retry)"}
-    else:
-        # A connection/auth failure inside the script also reports as
-        # status "ERROR" - same treatment, back in the queue. The script
-        # usually can't read the device's MAC on a connection failure
-        # (it never got that far), so fall back to the watcher's
-        # ip->mac map — ISE already told us the MAC when the session
-        # first appeared, no reason to lose it here.
-        pending = requeue(ip) if parsed.get("status") == "ERROR" else read_queue()
-        entry = {
-            "time": datetime.datetime.now().strftime("%H:%M:%S"),
-            "ip": ip,
-            "computer": parsed.get("computer"),
-            "mac": parsed.get("mac") or lookup_known_mac(ip),
-            "os": parsed.get("os"),
-            "status": parsed.get("status"),
-            "detail": parsed.get("detail") + (" (re-queued for retry)" if parsed.get("status") == "ERROR" else ""),
-            "submitted": parsed.get("submitted"),
-            "submitError": parsed.get("submitError"),
-        }
-
-    RESULTS.append(entry)
-    return jsonify({"result": entry, "pending": pending})
+    return jsonify({"needs_attention": get_needs_attention()})
 
 
 # ---------------------------------------------------------------------------
@@ -447,11 +512,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   <div class="panel">
     <div class="panel-title">
-      <span>Pending devices</span>
+      <span>Needs attention</span>
       <span id="pending-count">0</span>
     </div>
     <div class="panel-body" id="queue-list">
-      <div class="empty">No devices pending. Waiting on ise_session_watcher.py...</div>
+      <div class="empty">Nothing needs attention. New devices are checked automatically as they connect.</div>
     </div>
   </div>
 
@@ -462,7 +527,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <footer>Polling every 4s &middot; queue file: pending_devices.txt</footer>
+  <footer>Devices are checked automatically as they connect &middot; polling every 4s</footer>
 </div>
 
 <script>
@@ -511,7 +576,7 @@ function rowTemplate(ip) {
       <span class="dot"></span>
       <span class="ip mono">${safeIp}</span>
       <span class="spacer"></span>
-      <button class="run" data-ip="${safeIp}">Run</button>
+      <button class="run" data-ip="${safeIp}">Retry</button>
       <button class="override-link" data-ip="${safeIp}">different creds?</button>
       <button class="skip" data-ip="${safeIp}">Skip</button>
     </div>
@@ -529,7 +594,7 @@ function renderQueue(pending) {
   const list = document.getElementById('queue-list');
   document.getElementById('pending-count').textContent = pending.length;
   if (pending.length === 0) {
-    list.innerHTML = '<div class="empty">No devices pending. Waiting on ise_session_watcher.py...</div>';
+    list.innerHTML = '<div class="empty">Nothing needs attention. New devices are checked automatically as they connect.</div>';
     return;
   }
   list.innerHTML = '';
@@ -568,8 +633,8 @@ function renderResults(results) {
 }
 
 async function refreshQueue() {
-  const data = await fetchJSON('/api/queue');
-  currentPending = data.pending;
+  const data = await fetchJSON('/api/needs_attention');
+  currentPending = data.needs_attention;
   if (formOpenFor) return; // don't rebuild the list out from under an open form
   renderQueue(applyPendingFilter(currentPending));
 }
@@ -585,16 +650,18 @@ document.addEventListener('click', async (e) => {
   if (!ip) return;
 
   if (e.target.classList.contains('run')) {
-    // One click, no form: runs immediately using the stored common
-    // credential (posture_agent.ps1 loads it automatically).
+    // Retry with the stored common credential (posture_agent.ps1 loads
+    // it automatically). Only reachable here because this device
+    // already failed once - first attempts happen automatically in
+    // the background, before anything shows up in this list.
     e.target.disabled = true;
-    e.target.textContent = 'Running...';
+    e.target.textContent = 'Retrying...';
     const data = await fetchJSON('/api/check', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ip})
     });
-    currentPending = data.pending;
+    currentPending = data.needs_attention;
     renderQueue(applyPendingFilter(currentPending));
     refreshResults();
   }
@@ -619,7 +686,7 @@ document.addEventListener('click', async (e) => {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ip})
     });
-    currentPending = data.pending;
+    currentPending = data.needs_attention;
     renderQueue(applyPendingFilter(currentPending));
     refreshResults();
   }
@@ -638,7 +705,7 @@ document.addEventListener('click', async (e) => {
       body: JSON.stringify({ip, username, password})
     });
     formOpenFor = null;
-    currentPending = data.pending;
+    currentPending = data.needs_attention;
     renderQueue(applyPendingFilter(currentPending));
     refreshResults();
   }
@@ -665,4 +732,6 @@ if __name__ == "__main__":
     print(f"Queue file: {QUEUE_FILE}")
     print(f"PS script:  {PS_SCRIPT}")
     print(f"Posture server: {POSTURE_SERVER}")
-    app.run(host="127.0.0.1", port=UI_PORT, debug=False)
+    print("Auto-worker running: new devices are checked automatically in the background.")
+    threading.Thread(target=auto_worker, daemon=True).start()
+    app.run(host="127.0.0.1", port=UI_PORT, debug=False, threaded=True)

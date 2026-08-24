@@ -208,6 +208,26 @@
   .cred-form { display: none; gap: 8px; width: 100%; margin-top: 8px; }
   .cred-form.open { display: flex; }
   .cred-form input { font: inherit; font-size: 12.5px; padding: 6px 9px; border: 1px solid var(--border); border-radius: 6px; flex: 1; }
+
+  /* Expandable endpoint details styling */
+  .endpoint-row { cursor: pointer; transition: background 0.15s ease; }
+  .endpoint-row:hover { background: var(--border-soft, #f0f1f3); }
+  .details-row { background: var(--bg, #f7f7f8); }
+  .endpoint-details-expanded { padding: 16px; border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); }
+  .details-grid { display: grid; grid-template-columns: 1fr 1.2fr; gap: 24px; }
+  .details-col h4 { margin-top: 0; margin-bottom: 12px; color: var(--text); font-size: 13px; font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  .details-col div { margin-bottom: 6px; font-size: 12.5px; }
+  .checks-list { display: flex; flex-direction: column; gap: 8px; }
+  .check-item { display: flex; align-items: center; gap: 8px; }
+  .check-icon { font-size: 14px; flex-shrink: 0; }
+  .check-name { font-size: 12.5px; }
+  
+  /* Ports layout styling */
+  .ports-list-wrap { max-height: 150px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; background: #fff; }
+  .ports-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .ports-table th, .ports-table td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border-soft); }
+  .ports-table th { background: var(--bg); font-weight: 600; position: sticky; top: 0; }
+  .ports-table tr:last-child td { border-bottom: none; }
 </style>
 </head>
 <body>
@@ -559,7 +579,7 @@ async function loadDashboard() {
       { name: 'Posture App', tag: health.posture_app.reachable ? 'Healthy' : 'Unreachable', kind: health.posture_app.reachable ? 'ok' : 'bad' },
       { name: 'ISE Configuration', tag: health.ise_configured ? 'Configured' : 'Not configured', kind: health.ise_configured ? 'ok' : 'bad' },
       { name: 'Session Watcher', tag: health.watcher.last_activity ? health.watcher.last_activity : 'No data', kind: health.watcher.recent ? 'ok' : 'bad' },
-      { name: 'Database', tag: 'No DB in this build', kind: 'soon' },
+      { name: 'Database', tag: health.database && health.database.built ? health.database.note : 'No DB in this build', kind: health.database && health.database.built ? 'ok' : 'soon' },
       { name: 'Report Service', tag: 'Not built', kind: 'soon' },
       { name: 'Notification Service', tag: 'Not built', kind: 'soon' },
     ];
@@ -661,17 +681,81 @@ document.getElementById('page-assessments').addEventListener('click', async (e) 
   }
 });
 
+function toggleEndpointDetails(index) {
+  const row = document.getElementById('details-row-' + index);
+  if (row) {
+    row.style.display = row.style.display === 'none' ? '' : 'none';
+  }
+}
+
 // ---- Endpoints page ----
 async function loadEndpoints() {
   const data = await fetchJSON('/api/dashboard/endpoints');
   document.getElementById('endpoints-body').innerHTML = data.endpoints.length
-    ? data.endpoints.map(e => `
-      <tr><td>${esc(e.hostname || '—')}</td>
-      <td class="mono">${esc(e.ip || '—')}</td>
-      <td class="mono">${esc(e.mac || '—')}</td>
-      <td>${esc(e.os || '—')}</td>
-      <td><span class="badge ${statusClass(e.status)}">${esc(e.status)}</span></td>
-      <td>${esc(e.last_seen_date ? e.last_seen_date + ' ' + (e.last_seen || '') : 'Never')}</td></tr>`).join('')
+    ? data.endpoints.map((e, index) => {
+      const checksHTML = (e.checks && e.checks.length) 
+        ? e.checks.map(c => `
+          <div class="check-item">
+            <span class="check-icon">${c.status === 'COMPLIANT' ? '&#9989;' : '&#10060;'}</span>
+            <span class="check-name"><strong>${esc(c.name)}</strong> &middot; ${esc(c.detail)}</span>
+          </div>`).join('')
+        : '<div class="check-item"><span class="check-icon">&#9888;</span><span class="check-name">No checks executed yet.</span></div>';
+
+      const portsHTML = (e.ports && e.ports.length)
+        ? `
+        <div class="ports-list-wrap">
+          <table class="ports-table">
+            <thead>
+              <tr><th>Port</th><th>Process</th><th>PID</th></tr>
+            </thead>
+            <tbody>
+              ${e.ports.map(p => `
+                <tr>
+                  <td><strong>${p.port}</strong></td>
+                  <td class="mono">${esc(p.process || 'unknown')}</td>
+                  <td>${p.pid || '—'}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>`
+        : '<div class="check-item"><span class="check-icon">&#9888;</span><span class="check-name">No active TCP listening ports found.</span></div>';
+
+      return `
+      <tr class="endpoint-row" onclick="toggleEndpointDetails(${index})">
+        <td>${esc(e.hostname || '—')}</td>
+        <td class="mono">${esc(e.ip || '—')}</td>
+        <td class="mono">${esc(e.mac || '—')}</td>
+        <td>${esc(e.os || '—')}</td>
+        <td><span class="badge ${statusClass(e.status)}">${esc(e.status)}</span></td>
+        <td>${esc(e.last_seen_date ? e.last_seen_date + ' ' + (e.last_seen || '') : 'Never')}</td>
+      </tr>
+      <tr id="details-row-${index}" class="details-row" style="display:none;">
+        <td colspan="6">
+          <div class="endpoint-details-expanded">
+            <div class="details-grid">
+              <div class="details-col">
+                <h4>System Information & Services</h4>
+                <div><strong>Hostname:</strong> ${esc(e.hostname || '—')}</div>
+                <div><strong>IP Address:</strong> ${esc(e.ip || '—')}</div>
+                <div><strong>MAC Address:</strong> ${esc(e.mac || '—')}</div>
+                <div><strong>OS Caption:</strong> ${esc(e.os || '—')}</div>
+                <div><strong>OS Version:</strong> ${esc(e.os_version || '—')}</div>
+                <div><strong>Applications Installed:</strong> ${e.apps_count || '0'}</div>
+                <h4 style="margin-top:16px;">TCP Port Inventory</h4>
+                ${portsHTML}
+              </div>
+              <div class="details-col">
+                <h4>Compliance Checklist</h4>
+                <div class="checks-list">
+                  ${checksHTML}
+                </div>
+              </div>
+            </div>
+          </div>
+        </td>
+      </tr>`;
+    }).join('')
     : '<tr><td colspan="6" class="empty">No endpoints seen yet.</td></tr>';
 }
 

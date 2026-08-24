@@ -250,6 +250,56 @@ ise = ISEClient(ISE_HOST, ISE_USER, ISE_PASS, verify=VERIFY_TLS)
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
+import sqlite3
+DB_FILE = os.environ.get("POSTURE_DB_FILE", "posture.db")
+
+def save_posture_to_db(mac, ip, hostname, os_name, os_version, status, detail, submitted, submit_error, checks, apps_count, listening_ports):
+    try:
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
+            conn.execute("PRAGMA foreign_keys = ON;")
+            conn.execute("PRAGMA journal_mode = WAL;")
+            cursor = conn.cursor()
+            
+            # 1. Update/Insert endpoint
+            cursor.execute("""
+                INSERT INTO endpoints (mac, ip, hostname, os, os_version, last_seen, first_seen, apps_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(mac) DO UPDATE SET
+                    ip = excluded.ip,
+                    hostname = excluded.hostname,
+                    os = COALESCE(excluded.os, endpoints.os),
+                    os_version = COALESCE(excluded.os_version, endpoints.os_version),
+                    last_seen = excluded.last_seen,
+                    apps_count = excluded.apps_count
+            """, (mac.upper(), ip, hostname, os_name, os_version, timestamp, timestamp, apps_count))
+            
+            # 2. Insert assessment
+            cursor.execute("""
+                INSERT INTO assessments (mac, ip, timestamp, status, detail, submitted, submit_error, apps_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (mac.upper(), ip, timestamp, status, detail, submitted, submit_error, apps_count))
+            assessment_id = cursor.lastrowid
+            
+            # 3. Insert checks
+            for c in checks:
+                cursor.execute("""
+                    INSERT INTO check_results (assessment_id, check_name, status, detail)
+                    VALUES (?, ?, ?, ?)
+                """, (assessment_id, c.get("Check"), c.get("Status"), c.get("Details")))
+                
+            # 4. Save ports if any
+            if listening_ports:
+                cursor.execute("DELETE FROM endpoint_ports WHERE mac = ?", (mac.upper(),))
+                for p in listening_ports:
+                    cursor.execute("""
+                        INSERT INTO endpoint_ports (mac, port, process, pid, timestamp)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (mac.upper(), p.get("port"), p.get("process"), p.get("pid"), timestamp))
+            conn.commit()
+    except Exception as e:
+        log.error("Failed to save posture result to SQLite: %s", e)
+
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -274,8 +324,13 @@ def receive_posture():
 
     mac = endpoint.get("mac")
     hostname = endpoint.get("hostname")
+    os_name = endpoint.get("operating_system")
+    os_version = endpoint.get("os_version")
+    
     raw_status = posture.get("status")
     checks = posture.get("checks", [])
+    apps_count = posture.get("appsCount") or 0
+    listening_ports = posture.get("listening_ports") or []
 
     if not mac:
         return jsonify({"status": "ERROR", "message": "endpoint.mac is required"}), 400
@@ -284,9 +339,13 @@ def receive_posture():
 
     ise_status = STATUS_MAP[raw_status]
     failed = ", ".join(c.get("Check", "?") for c in checks if c.get("Status") != "COMPLIANT")
+    detail = checks[0].get("Details", raw_status) if checks else raw_status
 
     log.info("Received posture for %s (%s): %s | failed=%s", hostname, mac, raw_status, failed or "none")
 
+    submitted = True
+    submit_error = None
+    enforcement = None
     try:
         ise.write_posture(mac, ise_status, failed)
         if ENFORCEMENT_MODE == "anc":
@@ -296,14 +355,18 @@ def receive_posture():
     except requests.HTTPError as e:
         body = e.response.text if e.response is not None else ""
         log.error("ISE call failed for %s: %s | %s", mac, e, body)
+        submitted = False
+        submit_error = str(e)
+        save_posture_to_db(mac, request.remote_addr, hostname, os_name, os_version, raw_status, detail, submitted, submit_error, checks, apps_count, listening_ports)
         return jsonify({"status": "ERROR", "message": f"ISE API call failed: {e}"}), 502
     except Exception as e:
-        # Catches anything that isn't a plain HTTP error from ISE — bad/empty
-        # JSON in an ISE response, a connection or SSL problem, etc. — so the
-        # real cause shows up in the Postman response instead of a blank
-        # Flask 500 page. Full traceback still goes to the server log too.
         log.exception("Unexpected error handling posture for %s", mac)
+        submitted = False
+        submit_error = str(e)
+        save_posture_to_db(mac, request.remote_addr, hostname, os_name, os_version, raw_status, detail, submitted, submit_error, checks, apps_count, listening_ports)
         return jsonify({"status": "ERROR", "message": f"Unexpected server error: {e}"}), 500
+
+    save_posture_to_db(mac, request.remote_addr, hostname, os_name, os_version, raw_status, detail, submitted, submit_error, checks, apps_count, listening_ports)
 
     return jsonify({
         "status": "SUCCESS",

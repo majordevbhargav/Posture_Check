@@ -293,6 +293,7 @@ try {
             $Nic = Get-CimInstance @CimParams -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Select-Object -First 1
         }
 
+        # Query Windows Firewall Status
         $FwDisabled = Get-CimInstance @CimParams -Namespace ROOT\StandardCimv2 -ClassName MSFT_NetFirewallProfile |
                       Where-Object { -not $_.Enabled }
         $Compliant = $FwDisabled.Count -eq 0
@@ -301,6 +302,35 @@ try {
             "All firewall profiles enabled"
         } else {
             "Disabled: " + (($FwDisabled | Select-Object -ExpandProperty Name) -join ", ")
+        }
+
+        # Query TCP listening ports (State=2 is Listen) for visibility
+        $Ports = @()
+        try {
+            $Connections = Get-CimInstance @CimParams -Namespace ROOT\StandardCimv2 -ClassName MSFT_NetTCPConnection -Filter "State=2" -ErrorAction SilentlyContinue
+            if ($Connections) {
+                $Pids = $Connections | Select-Object -ExpandProperty OwningProcess -Unique
+                $ProcMap = @{}
+                if ($Pids) {
+                    $PidsFilter = ($Pids | ForEach-Object { "ProcessId=$_" }) -join " or "
+                    $Processes = Get-CimInstance @CimParams -ClassName Win32_Process -Filter $PidsFilter -ErrorAction SilentlyContinue
+                    foreach ($p in $Processes) {
+                        $ProcMap[$p.ProcessId] = $p.Name
+                    }
+                }
+                
+                foreach ($c in $Connections) {
+                    $pid = $c.OwningProcess
+                    $procName = if ($ProcMap.ContainsKey($pid)) { $ProcMap[$pid] } else { "Unknown" }
+                    $Ports += @{
+                        port = $c.LocalPort
+                        process = $procName
+                        pid = $pid
+                    }
+                }
+            }
+        } catch {
+            Write-Host "WARNING: Failed to query listening ports: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     } catch {
         # Connected fine, but the actual query failed (e.g. some machines

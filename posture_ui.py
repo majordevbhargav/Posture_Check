@@ -38,6 +38,8 @@ import msvcrt
 import threading
 import subprocess
 import datetime
+import urllib.request
+import urllib.parse
 from pathlib import Path
 
 from flask import Flask, request, jsonify, Response
@@ -53,7 +55,22 @@ AUTO_WORKER_POLL_SECONDS = float(os.environ.get("AUTO_WORKER_POLL_SECONDS", "3")
 # to read the MAC directly off the device (e.g. a connection failure).
 IP_MAC_MAP_FILE = os.environ.get("IP_MAC_MAP_FILE", "ip_mac_map.txt")
 
+# RESULTS/NEEDS_ATTENTION are written here after every change and reloaded
+# at startup, so a Flask restart doesn't wipe your history. Best-effort:
+# a write failure here never blocks or fails a live check.
+STATE_FILE = os.environ.get("POSTURE_UI_STATE_FILE", "posture_ui_state.json")
+
 app = Flask(__name__)
+
+DASHBOARD_HTML_PATH = Path(__file__).parent / "dashboard.html"
+
+
+def _read_dashboard_html() -> str:
+    try:
+        return DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ("<h1>dashboard.html not found</h1><p>Expected it next to posture_ui.py. "
+                "The original console is still available at <a href='/console'>/console</a>.</p>")
 
 # In-memory results log - resets if this server restarts. Fine for a POC
 # console; swap for a real store if you need history to survive restarts.
@@ -154,18 +171,46 @@ def requeue(ip: str):
         _unlock_close(f)
 
 
+def _write_state_snapshot(snapshot: dict) -> None:
+    try:
+        Path(STATE_FILE).write_text(json.dumps(snapshot), encoding="utf-8")
+    except Exception:
+        pass  # persistence is best-effort; never let it break a live check
+
+
+def load_state() -> None:
+    """Called once at startup - restores RESULTS/NEEDS_ATTENTION from the
+    last run, if the state file exists and is readable."""
+    path = Path(STATE_FILE)
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    with STATE_LOCK:
+        RESULTS.extend(data.get("results", []))
+        for ip in data.get("needs_attention", []):
+            if ip not in NEEDS_ATTENTION:
+                NEEDS_ATTENTION.append(ip)
+
+
 def add_needs_attention(ip: str):
     with STATE_LOCK:
         if ip not in NEEDS_ATTENTION:
             NEEDS_ATTENTION.append(ip)
-        return list(NEEDS_ATTENTION)
+        snapshot = {"results": RESULTS[-500:], "needs_attention": list(NEEDS_ATTENTION)}
+    _write_state_snapshot(snapshot)
+    return snapshot["needs_attention"]
 
 
 def remove_needs_attention(ip: str):
     with STATE_LOCK:
         if ip in NEEDS_ATTENTION:
             NEEDS_ATTENTION.remove(ip)
-        return list(NEEDS_ATTENTION)
+        snapshot = {"results": RESULTS[-500:], "needs_attention": list(NEEDS_ATTENTION)}
+    _write_state_snapshot(snapshot)
+    return snapshot["needs_attention"]
 
 
 def get_needs_attention():
@@ -176,12 +221,19 @@ def get_needs_attention():
 def append_result(entry: dict):
     with STATE_LOCK:
         RESULTS.append(entry)
+        snapshot = {"results": RESULTS[-500:], "needs_attention": list(NEEDS_ATTENTION)}
+    _write_state_snapshot(snapshot)
 
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 @app.route("/")
+def dashboard_page():
+    return Response(_read_dashboard_html(), mimetype="text/html")
+
+
+@app.route("/console")
 def index():
     return Response(INDEX_HTML, mimetype="text/html")
 
@@ -205,7 +257,8 @@ def run_check(ip: str, username: str = None, password: str = None) -> dict:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
     except subprocess.TimeoutExpired:
         add_needs_attention(ip)
-        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "ip": ip,
+        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"),
+                  "date": datetime.datetime.now().strftime("%Y-%m-%d"), "ip": ip,
                   "mac": lookup_known_mac(ip), "status": "ERROR",
                   "detail": "Timed out waiting for the check to finish."}
         append_result(entry)
@@ -213,7 +266,8 @@ def run_check(ip: str, username: str = None, password: str = None) -> dict:
     except Exception as e:
         # PowerShell itself not runnable, permissions error, etc.
         add_needs_attention(ip)
-        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "ip": ip,
+        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"),
+                  "date": datetime.datetime.now().strftime("%Y-%m-%d"), "ip": ip,
                   "mac": lookup_known_mac(ip), "status": "ERROR",
                   "detail": f"Unexpected error running the check: {e}"}
         append_result(entry)
@@ -232,7 +286,8 @@ def run_check(ip: str, username: str = None, password: str = None) -> dict:
         # whatever it printed instead of failing silently.
         add_needs_attention(ip)
         detail = (proc.stderr or proc.stdout or "No output from the script.").strip()[-500:]
-        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "ip": ip,
+        entry = {"time": datetime.datetime.now().strftime("%H:%M:%S"),
+                  "date": datetime.datetime.now().strftime("%Y-%m-%d"), "ip": ip,
                   "mac": lookup_known_mac(ip), "status": "ERROR", "detail": detail}
     else:
         is_error = parsed.get("status") == "ERROR"
@@ -240,6 +295,7 @@ def run_check(ip: str, username: str = None, password: str = None) -> dict:
             add_needs_attention(ip)
         entry = {
             "time": datetime.datetime.now().strftime("%H:%M:%S"),
+            "date": datetime.datetime.now().strftime("%Y-%m-%d"),
             "ip": ip,
             "computer": parsed.get("computer"),
             "mac": parsed.get("mac") or lookup_known_mac(ip),
@@ -280,7 +336,8 @@ def api_needs_attention():
 
 @app.route("/api/results")
 def api_results():
-    return jsonify({"results": RESULTS[-50:][::-1]})
+    limit = request.args.get("limit", default=50, type=int)
+    return jsonify({"results": RESULTS[-limit:][::-1]})
 
 
 @app.route("/api/skip", methods=["POST"])
@@ -292,6 +349,7 @@ def api_skip():
     remaining = remove_needs_attention(ip)
     append_result({
         "time": datetime.datetime.now().strftime("%H:%M:%S"),
+        "date": datetime.datetime.now().strftime("%Y-%m-%d"),
         "ip": ip,
         "status": "SKIPPED",
         "detail": "Skipped - not checked.",
@@ -320,6 +378,211 @@ def api_check():
     run_check(ip, username or None, password or None)
 
     return jsonify({"needs_attention": get_needs_attention()})
+
+
+# ---------------------------------------------------------------------------
+# Dashboard API — all read-only, all computed from RESULTS/NEEDS_ATTENTION/
+# ip_mac_map.txt, which already exist. No new state, nothing that can
+# affect the check pipeline above; worst case one of these returns
+# incomplete data, it can never break a live check.
+# ---------------------------------------------------------------------------
+def _endpoint_key(entry: dict) -> str:
+    """A 'device' in this system is really 'one MAC' (or its IP, if the
+    MAC is unknown) — same identity model used everywhere else, kept
+    consistent here rather than inventing a new one for the dashboard."""
+    return (entry.get("mac") or entry.get("ip") or "unknown").upper()
+
+
+def _latest_by_endpoint():
+    """Returns ({endpoint_key: latest_result_entry}, {needs_attention_ips})
+    RESULTS is append-ordered, so the last entry per key IS the latest —
+    no separate 'history' structure needed for this."""
+    with STATE_LOCK:
+        results_copy = list(RESULTS)
+        needs = set(NEEDS_ATTENTION)
+    latest = {}
+    for e in results_copy:
+        latest[_endpoint_key(e)] = e
+    return latest, needs
+
+
+@app.route("/api/dashboard/summary")
+def api_dashboard_summary():
+    latest, needs = _latest_by_endpoint()
+    compliant = sum(1 for k, e in latest.items() if e.get("status") == "COMPLIANT" and k not in needs)
+    non_compliant = sum(1 for k, e in latest.items() if e.get("status") == "NON-COMPLIANT" and k not in needs)
+    at_risk = len(needs)  # agreed definition: At Risk = currently unverifiable (Needs Attention)
+    total = max(len(latest), compliant + non_compliant + at_risk)
+
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    with STATE_LOCK:
+        assessments_today = sum(1 for e in RESULTS if e.get("date") == today)
+
+    # Roadmap section 3.1's formula: At Risk counts as half-credit since
+    # it's "unknown," not "known bad." A weighting/policy decision, not
+    # a technical one - confirmed with the analyst before building this.
+    score = round((compliant * 1.0 + at_risk * 0.5) / total * 100) if total else None
+
+    return jsonify({
+        "total_endpoints": total,
+        "compliant": compliant,
+        "non_compliant": non_compliant,
+        "at_risk": at_risk,
+        "assessments_today": assessments_today,
+        "compliance_score": score,
+    })
+
+
+@app.route("/api/dashboard/trend")
+def api_dashboard_trend():
+    """Bucketed from real result timestamps, over a caller-chosen range.
+    days=1 is treated as "last 24 hours" and bucketed HOURLY, rolling
+    from right now — a single daily bucket at that range would just
+    show one flat number for the whole day, which isn't a useful trend
+    view. days=7/30/90 stay daily-bucketed, calendar-day aligned."""
+    days_param = request.args.get("days", type=int) or 7
+    days_param = max(1, min(days_param, 90))
+    with STATE_LOCK:
+        results_copy = list(RESULTS)
+
+    if days_param == 1:
+        now = datetime.datetime.now()
+        current_hour = now.replace(minute=0, second=0, microsecond=0)
+        hour_starts = [current_hour - datetime.timedelta(hours=i) for i in range(23, -1, -1)]
+        keys = [h.strftime("%Y-%m-%d %H") for h in hour_starts]
+        labels = [h.strftime("%H:00") for h in hour_starts]
+        buckets = {k: {"compliant": 0, "non_compliant": 0, "at_risk": 0} for k in keys}
+        cutoff = hour_starts[0]
+
+        for e in results_copy:
+            d, t = e.get("date"), e.get("time")
+            if not d or not t:
+                continue  # older entries saved before "date" existed - excluded, not guessed at
+            try:
+                ts = datetime.datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if ts < cutoff:
+                continue
+            b = buckets.get(ts.strftime("%Y-%m-%d %H"))
+            if not b:
+                continue
+            status = e.get("status")
+            if status == "COMPLIANT":
+                b["compliant"] += 1
+            elif status == "NON-COMPLIANT":
+                b["non_compliant"] += 1
+            elif status == "ERROR":
+                b["at_risk"] += 1
+
+        return jsonify({"days": labels, "buckets": [buckets[k] for k in keys], "granularity": "hourly"})
+
+    today = datetime.date.today()
+    days = [(today - datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days_param - 1, -1, -1)]
+    buckets = {d: {"compliant": 0, "non_compliant": 0, "at_risk": 0} for d in days}
+    for e in results_copy:
+        b = buckets.get(e.get("date"))
+        if not b:
+            continue
+        status = e.get("status")
+        if status == "COMPLIANT":
+            b["compliant"] += 1
+        elif status == "NON-COMPLIANT":
+            b["non_compliant"] += 1
+        elif status == "ERROR":
+            b["at_risk"] += 1
+    return jsonify({"days": days, "buckets": [buckets[d] for d in days], "granularity": "daily"})
+
+
+# Only Firewall is real today. The other five are listed here, marked
+# not-implemented, so the dashboard shows the honest category set from
+# the roadmap instead of inventing numbers for checks that don't exist.
+OTHER_CATEGORIES = ["Anti-Virus", "OS Patch Level", "Disk Encryption", "Security Settings", "Application Control"]
+
+
+@app.route("/api/dashboard/categories")
+def api_dashboard_categories():
+    latest, needs = _latest_by_endpoint()
+    compliant = sum(1 for k, e in latest.items() if e.get("status") == "COMPLIANT" and k not in needs)
+    non_compliant = sum(1 for k, e in latest.items() if e.get("status") == "NON-COMPLIANT" and k not in needs)
+    denom = compliant + non_compliant
+    firewall_pct = round((compliant / denom) * 100) if denom else None
+
+    categories = [{"name": "Firewall", "implemented": True, "percent": firewall_pct}]
+    categories += [{"name": n, "implemented": False, "percent": None} for n in OTHER_CATEGORIES]
+    return jsonify({"categories": categories})
+
+
+@app.route("/api/dashboard/endpoints")
+def api_dashboard_endpoints():
+    """A real inventory, not just 'currently pending' — every device
+    that's ever produced a result, plus anything the watcher has seen
+    an IP/MAC for but hasn't been checked yet."""
+    latest, needs = _latest_by_endpoint()
+
+    known_ips = {}
+    p = Path(IP_MAC_MAP_FILE)
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if "," in line:
+                ip, mac = line.split(",", 1)
+                known_ips[ip.strip()] = mac.strip()
+
+    rows = []
+    seen_keys = set()
+    for key, e in latest.items():
+        seen_keys.add(key)
+        status = "At Risk" if key in needs else (e.get("status") or "Unknown").title()
+        rows.append({
+            "identity": key, "ip": e.get("ip"), "mac": e.get("mac"),
+            "hostname": e.get("computer"), "os": e.get("os"), "status": status,
+            "last_seen": e.get("time"), "last_seen_date": e.get("date"),
+        })
+    for ip, mac in known_ips.items():
+        key = (mac or ip).upper()
+        if key in seen_keys:
+            continue
+        rows.append({
+            "identity": key, "ip": ip, "mac": mac, "hostname": None,
+            "os": None, "status": "Never Checked", "last_seen": None, "last_seen_date": None,
+        })
+    rows.sort(key=lambda r: (r.get("last_seen_date") or "", r.get("last_seen") or ""), reverse=True)
+    return jsonify({"endpoints": rows})
+
+
+@app.route("/api/dashboard/health")
+def api_dashboard_health():
+    """Deliberately honest, not decorative — a service that isn't built
+    yet says so, rather than showing a fake green 'Healthy' badge."""
+    parts = urllib.parse.urlsplit(POSTURE_SERVER)
+    health_url = f"{parts.scheme}://{parts.netloc}/health"
+    posture_app_ok = False
+    ise_configured = None
+    try:
+        with urllib.request.urlopen(health_url, timeout=3) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            posture_app_ok = True
+            ise_configured = body.get("ise_configured")
+    except Exception:
+        pass
+
+    watcher_last_seen = None
+    watcher_recent = False
+    map_path = Path(IP_MAC_MAP_FILE)
+    if map_path.exists():
+        age = time.time() - map_path.stat().st_mtime
+        watcher_last_seen = f"{int(age)}s ago" if age < 120 else f"{int(age // 60)}m ago"
+        watcher_recent = age < 300  # heuristic based on file activity, not a real process check
+
+    return jsonify({
+        "posture_app": {"reachable": posture_app_ok, "url": health_url},
+        "ise_configured": ise_configured,
+        "watcher": {"last_activity": watcher_last_seen, "recent": watcher_recent},
+        "database": {"built": False, "note": "No database in this build — state is a JSON file."},
+        "policy_service": {"built": False},
+        "report_service": {"built": False},
+        "notification_service": {"built": False},
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +995,8 @@ if __name__ == "__main__":
     print(f"Queue file: {QUEUE_FILE}")
     print(f"PS script:  {PS_SCRIPT}")
     print(f"Posture server: {POSTURE_SERVER}")
+    load_state()
+    print(f"Restored {len(RESULTS)} result(s) and {len(NEEDS_ATTENTION)} needs-attention item(s) from {STATE_FILE}")
     print("Auto-worker running: new devices are checked automatically in the background.")
     threading.Thread(target=auto_worker, daemon=True).start()
     app.run(host="127.0.0.1", port=UI_PORT, debug=False, threaded=True)

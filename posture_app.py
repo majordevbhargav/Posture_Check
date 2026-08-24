@@ -49,11 +49,27 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger("posture_app")
 
 # ---------------------------------------------------------------------------
-# Config — nothing hardcoded. Set these as environment variables.
+# Config — ISE_HOST/ISE_USER/ISE_PASS are REQUIRED environment variables,
+# no defaults. A hardcoded fallback password here would mean this app
+# silently runs against a real ISE with a guessable credential if someone
+# forgets to set the env vars - refusing to start is the safer failure
+# mode. Set them before running (see module docstring above).
 # ---------------------------------------------------------------------------
-ISE_HOST = os.environ.get("ISE_HOST", "https://10.6.1.90")
-ISE_USER = os.environ.get("ISE_USER", "Dev")
-ISE_PASS = os.environ.get("ISE_PASS", "Login@123")
+def _require_env(name: str) -> str:
+    val = os.environ.get(name)
+    if not val:
+        raise RuntimeError(
+            f"{name} is not set. This app requires ISE_HOST, ISE_USER, and ISE_PASS "
+            f"to be set as environment variables before starting (see the module "
+            f"docstring for the exact commands). Refusing to start with a missing "
+            f"or hardcoded default credential."
+        )
+    return val
+
+
+ISE_HOST = _require_env("ISE_HOST")
+ISE_USER = _require_env("ISE_USER")
+ISE_PASS = _require_env("ISE_PASS")
 VERIFY_TLS = os.environ.get("ISE_VERIFY_TLS", "false").lower() == "true"
 
 # Optional shared-secret header check for agent -> app calls. Leave unset
@@ -108,6 +124,19 @@ class ISEClient:
         data = self._get(f"/ers/config/endpoint?filter=mac.EQ.{mac}")
         resources = data.get("SearchResult", {}).get("resources", [])
         return resources[0]["id"] if resources else None
+
+    def check_ise_reachable(self) -> bool:
+        """A real, cheap reachability check — one small ERS call with a
+        short timeout, not a hardcoded True. Used by /health, which the
+        dashboard's System Health panel reads directly."""
+        try:
+            r = requests.get(
+                f"{self.base}/ers/config/endpoint?filter=mac.EQ.00:00:00:00:00:00&size=1",
+                auth=self.auth, headers=HEADERS, verify=self.verify, timeout=5,
+            )
+            return r.status_code < 500
+        except Exception:
+            return False
 
     def write_posture(self, mac: str, status: str, failed_checks: str):
         attrs = {
@@ -213,7 +242,7 @@ class ISEClient:
         }
 
 
-ise = ISEClient(ISE_HOST, ISE_USER, ISE_PASS, verify=VERIFY_TLS) if (ISE_HOST and ISE_USER and ISE_PASS) else None
+ise = ISEClient(ISE_HOST, ISE_USER, ISE_PASS, verify=VERIFY_TLS)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +256,7 @@ def health():
     return jsonify({
         "application": "Posture Application (POC)",
         "status": "UP",
-        "ise_configured": ise is not None,
+        "ise_configured": ise.check_ise_reachable(),
     })
 
 
@@ -235,9 +264,6 @@ def health():
 def receive_posture():
     if POSTURE_API_KEY and request.headers.get("X-API-Key") != POSTURE_API_KEY:
         return jsonify({"status": "ERROR", "message": "Invalid or missing API key"}), 401
-
-    if ise is None:
-        return jsonify({"status": "ERROR", "message": "Server not configured — set ISE_HOST/ISE_USER/ISE_PASS"}), 500
 
     data = request.get_json(silent=True)
     if not data:
@@ -288,7 +314,5 @@ def receive_posture():
 
 
 if __name__ == "__main__":
-    if ise is None:
-        log.warning("ISE_HOST/ISE_USER/ISE_PASS not fully set — /api/v1/posture will return 500 until configured.")
     log.info("Listening on http://%s:%s", LISTEN_HOST, LISTEN_PORT)
     app.run(host=LISTEN_HOST, port=LISTEN_PORT, debug=False)

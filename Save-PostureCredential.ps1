@@ -32,6 +32,30 @@ if (-not $cred) {
     exit 0
 }
 
+# posture_agent.ps1 re-qualifies a handful of known wrong-scope patterns
+# automatically (no prefix, ".\", this machine's own name), but it can
+# only reliably do that when it's UNAMBIGUOUS that the prefix is wrong.
+# A prefix that's a specific device's IP address (e.g. "10.66.1.11") is
+# ambiguous by design — it might genuinely be what you meant. Catching
+# it here, once, at save time, is more reliable than guessing at use
+# time against every future device.
+$EnteredUser = $cred.UserName
+if ($EnteredUser -match '^(\d{1,3}(\.\d{1,3}){3})\\') {
+    Write-Host ""
+    Write-Host "WARNING: you entered '$EnteredUser' - that's scoped to ONE specific device ($($Matches[1])), not a general credential." -ForegroundColor Yellow
+    Write-Host "This credential is meant to be used against MANY devices automatically. If you continue, it will only work against $($Matches[1]) and will silently fail Access Denied on every other device." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "For a credential that works everywhere, use one of:" -ForegroundColor Yellow
+    Write-Host "  .\Administrator          (local account, same name on every target)" -ForegroundColor Yellow
+    Write-Host "  CORP\svc-posture         (a domain service account)" -ForegroundColor Yellow
+    Write-Host ""
+    $Continue = Read-Host "Save it scoped to $($Matches[1]) anyway? (Y/N)"
+    if ($Continue -notmatch '^[Yy]') {
+        Write-Host "Cancelled — nothing saved. Re-run and use .\Administrator or DOMAIN\user instead." -ForegroundColor Yellow
+        exit 0
+    }
+}
+
 $cred | Export-Clixml -Path $Path
 
 Write-Host ""

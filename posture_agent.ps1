@@ -41,6 +41,53 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Real cross-process file locking on pending_devices.txt, using the same
+# underlying Win32 LockFile/UnlockFile API that Python's msvcrt.locking
+# calls into on the watcher and posture_ui.py side. This is what actually
+# makes it interoperate with THEIR locks — a PowerShell-only locking
+# mechanism (e.g. a .lock sidecar file) would be invisible to those
+# processes and wouldn't prevent the race it's meant to prevent. Guarded
+# so re-running/dot-sourcing this script twice in one session doesn't
+# throw on "type already exists".
+if (-not ("Win32FileLock" -as [type])) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32FileLock {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool LockFile(IntPtr hFile, uint dwFileOffsetLow, uint dwFileOffsetHigh, uint nNumberOfBytesToLockLow, uint nNumberOfBytesToLockHigh);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool UnlockFile(IntPtr hFile, uint dwFileOffsetLow, uint dwFileOffsetHigh, uint nNumberOfBytesToUnlockLow, uint nNumberOfBytesToUnlockHigh);
+}
+"@
+}
+
+function Open-LockedQueueFile {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { New-Item -Path $Path -ItemType File -Force | Out-Null }
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+    $handle = $fs.SafeFileHandle.DangerousGetHandle()
+    # Same byte-0, length-1 region Python locks - retry briefly since the
+    # watcher or posture_ui.py may be holding it for a moment.
+    $locked = $false
+    for ($i = 0; $i -lt 50 -and -not $locked; $i++) {
+        $locked = [Win32FileLock]::LockFile($handle, 0, 0, 1, 0)
+        if (-not $locked) { Start-Sleep -Milliseconds 100 }
+    }
+    if (-not $locked) {
+        $fs.Close()
+        throw "Could not lock $Path (another process held it for 5s straight) - try again."
+    }
+    return $fs
+}
+
+function Close-LockedQueueFile {
+    param([System.IO.FileStream]$FileStream)
+    $handle = $FileStream.SafeFileHandle.DangerousGetHandle()
+    [Win32FileLock]::UnlockFile($handle, 0, 0, 1, 0) | Out-Null
+    $FileStream.Close()
+}
+
 # No -ComputerName given -> pull from the shared queue that
 # ise_session_watcher.py writes to, asking Y/N before each one so you
 # can skip devices you don't want to check right now. Skipped devices
@@ -52,24 +99,41 @@ if (-not $ComputerName) {
     }
 
     while (-not $ComputerName) {
-        $Pending = @(Get-Content $QueueFile | Where-Object { $_.Trim() -ne "" })
-        if ($Pending.Count -eq 0) {
-            Write-Host "Queue is empty - no pending devices to check."
-            exit 0
-        }
+        $Fs = Open-LockedQueueFile -Path $QueueFile
+        $Candidate = $null
+        $RemainingCount = 0
+        try {
+            $Reader = New-Object System.IO.StreamReader($Fs, [System.Text.Encoding]::UTF8, $true, 1024, $true)
+            $Content = $Reader.ReadToEnd()
+            $Reader.Dispose()
 
-        $Candidate = $Pending[0].Trim()
-        if ($Pending.Count -gt 1) {
-            Set-Content -Path $QueueFile -Value $Pending[1..($Pending.Count - 1)]
-        } else {
-            Clear-Content -Path $QueueFile
+            $Pending = @($Content -split "`r?`n" | Where-Object { $_.Trim() -ne "" })
+            if ($Pending.Count -eq 0) {
+                Write-Host "Queue is empty - no pending devices to check."
+                Close-LockedQueueFile -FileStream $Fs
+                exit 0
+            }
+
+            $Candidate = $Pending[0].Trim()
+            $Remaining = if ($Pending.Count -gt 1) { $Pending[1..($Pending.Count - 1)] } else { @() }
+            $RemainingCount = $Remaining.Count
+            $NewContent = if ($Remaining.Count -gt 0) { ($Remaining -join "`n") + "`n" } else { "" }
+
+            $Fs.Position = 0
+            $Fs.SetLength(0)
+            $Writer = New-Object System.IO.StreamWriter($Fs, [System.Text.Encoding]::UTF8, 1024, $true)
+            $Writer.Write($NewContent)
+            $Writer.Flush()
+            $Writer.Dispose()
+        } finally {
+            Close-LockedQueueFile -FileStream $Fs
         }
 
         $Answer = Read-Host "Run posture check on $Candidate`? (Y/N)"
         if ($Answer -match '^[Yy]') {
             $ComputerName = $Candidate
         } else {
-            Write-Host "Skipped $Candidate. ($($Pending.Count - 1) remaining in queue)"
+            Write-Host "Skipped $Candidate. ($RemainingCount remaining in queue)"
         }
     }
 }
@@ -93,17 +157,19 @@ function Get-PostureCred {
             # ComputerName\User before using it - that's what lets Windows
             # correctly resolve it as a LOCAL account ON THE TARGET, rather
             # than an ambiguous or (worse) wrongly-scoped one. A stored
-            # credential can be wrongly-scoped in three ways, all of which
-            # need re-qualifying to the CURRENT target here:
+            # credential can be wrongly-scoped in FOUR ways, all needing
+            # re-qualification to the CURRENT target here:
             #   - no prefix at all:      "Administrator"
-            #   - ".\" (means THIS machine, i.e. wherever the script is
+            #   - ".\" (means THIS machine, wherever the script is
             #     currently running - your laptop, not the target):
             #                            ".\Administrator"
-            #   - your own machine's literal name (same meaning as ".\",
-            #     just spelled out):     "YOUR-LAPTOP\Administrator"
-            # Any of these three, used as-is against a remote target, is
-            # either ambiguous or points at the wrong machine entirely -
-            # which looks exactly like "manual entry works, stored doesn't".
+            #   - your own machine's literal name (same meaning as ".\"):
+            #                            "YOUR-LAPTOP\Administrator"
+            #   - a DIFFERENT device's IP baked in at save time (e.g. it
+            #     was saved as "10.66.1.11\Administrator" instead of the
+            #     recommended ".\Administrator" or "DOMAIN\svc" pattern) -
+            #     that only ever worked against that one IP and silently
+            #     fails Access Denied against every other device.
             $BareUser = $StoredUser
             $Prefix = $null
             if ($StoredUser -match '\\') {
@@ -111,9 +177,16 @@ function Get-PostureCred {
                 $Prefix = $Parts[0]
                 $BareUser = $Parts[1]
             }
-            $NeedsRequalify = (-not $Prefix) -or ($Prefix -eq '.') -or ($Prefix -ieq $env:COMPUTERNAME)
+            $PrefixIsIp = $Prefix -and ($Prefix -match '^\d{1,3}(\.\d{1,3}){3}$')
+            $NeedsRequalify = (-not $Prefix) -or
+                              ($Prefix -eq '.') -or
+                              ($Prefix -ieq $env:COMPUTERNAME) -or
+                              ($PrefixIsIp -and $Prefix -ne $ComputerName)
 
             if ($NeedsRequalify) {
+                if ($PrefixIsIp -and $Prefix -ne $ComputerName) {
+                    Write-Host "Stored credential was saved scoped to $Prefix, not $ComputerName - re-qualifying for this target." -ForegroundColor DarkYellow
+                }
                 $QualifiedStoredUser = "$ComputerName\$BareUser"
                 $Stored = New-Object System.Management.Automation.PSCredential($QualifiedStoredUser, $Stored.Password)
             }
@@ -121,11 +194,28 @@ function Get-PostureCred {
             Write-Host "Using stored common credential ($($Stored.UserName)) for $ComputerName" -ForegroundColor DarkGray
             return $Stored
         } catch {
-            Write-Host "Could not load stored credential from $CommonCredPath ($($_.Exception.Message)) - falling back to prompt." -ForegroundColor Yellow
+            $ImportErr = $_.Exception.Message
+            if ($ImportErr -match 'Key not valid|invalid in the current context|padding is invalid|Cryptographic') {
+                $script:CredLoadWarning = "Could not decrypt the stored credential at $CommonCredPath. This almost always means it was saved under a DIFFERENT Windows user account or session than the one running this check right now - DPAPI-encrypted credentials only decrypt for the exact user+machine that created them. Re-run Save-PostureCredential.ps1 under the SAME account/session that runs posture_agent.ps1 (e.g. whatever Windows account posture_ui.py's Flask process itself runs as, if that's what's calling this)."
+            } else {
+                $script:CredLoadWarning = "Could not load stored credential from $CommonCredPath : $ImportErr"
+            }
+            Write-Host $script:CredLoadWarning -ForegroundColor Yellow
         }
     }
 
-    if (-not $Username) { $script:Username = Read-Host "Username on $ComputerName (e.g. Administrator)" }
+    if (-not $Username) {
+        try {
+            $script:Username = Read-Host "Username on $ComputerName (e.g. Administrator)"
+        } catch {
+            # Read-Host throws under -NonInteractive (always true for the
+            # web UI's subprocess calls) - without this catch, that raw
+            # PowerShell error is all that surfaces, which doesn't point
+            # at the actual root cause. Surface whatever we already know.
+            $Reason = if ($script:CredLoadWarning) { $script:CredLoadWarning } else { "No credential available, and this session can't prompt interactively (running non-interactively)." }
+            throw $Reason
+        }
+    }
     if ($PlainPassword) {
         # Built directly via the .NET class instead of ConvertTo-SecureString,
         # so this doesn't depend on the Microsoft.PowerShell.Security module
@@ -144,7 +234,20 @@ function Get-PostureCred {
 
 try {
     if ($IsRemote) {
-        $Cred = Get-PostureCred
+        try {
+            $Cred = Get-PostureCred
+        } catch {
+            Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+            $FailResult = [ordered]@{
+                computer  = $ComputerName
+                compliant = $null
+                status    = "ERROR"
+                detail    = $_.Exception.Message
+                submitted = $false
+            }
+            Write-Output ("RESULT_JSON:" + ($FailResult | ConvertTo-Json -Compress))
+            exit 1
+        }
 
         # Try DCOM first - no TrustedHosts/PSRemoting needed anywhere.
         try {
@@ -190,6 +293,7 @@ try {
             $Nic = Get-CimInstance @CimParams -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Select-Object -First 1
         }
 
+        # Query Windows Firewall Status
         $FwDisabled = Get-CimInstance @CimParams -Namespace ROOT\StandardCimv2 -ClassName MSFT_NetFirewallProfile |
                       Where-Object { -not $_.Enabled }
         $Compliant = $FwDisabled.Count -eq 0
@@ -198,6 +302,35 @@ try {
             "All firewall profiles enabled"
         } else {
             "Disabled: " + (($FwDisabled | Select-Object -ExpandProperty Name) -join ", ")
+        }
+
+        # Query TCP listening ports (State=2 is Listen) for visibility
+        $Ports = @()
+        try {
+            $Connections = Get-CimInstance @CimParams -Namespace ROOT\StandardCimv2 -ClassName MSFT_NetTCPConnection -Filter "State=2" -ErrorAction SilentlyContinue
+            if ($Connections) {
+                $Pids = $Connections | Select-Object -ExpandProperty OwningProcess -Unique
+                $ProcMap = @{}
+                if ($Pids) {
+                    $PidsFilter = ($Pids | ForEach-Object { "ProcessId=$_" }) -join " or "
+                    $Processes = Get-CimInstance @CimParams -ClassName Win32_Process -Filter $PidsFilter -ErrorAction SilentlyContinue
+                    foreach ($p in $Processes) {
+                        $ProcMap[$p.ProcessId] = $p.Name
+                    }
+                }
+                
+                foreach ($c in $Connections) {
+                    $pid = $c.OwningProcess
+                    $procName = if ($ProcMap.ContainsKey($pid)) { $ProcMap[$pid] } else { "Unknown" }
+                    $Ports += @{
+                        port = $c.LocalPort
+                        process = $procName
+                        pid = $pid
+                    }
+                }
+            }
+        } catch {
+            Write-Host "WARNING: Failed to query listening ports: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     } catch {
         # Connected fine, but the actual query failed (e.g. some machines

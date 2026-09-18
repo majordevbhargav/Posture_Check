@@ -49,11 +49,27 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger("posture_app")
 
 # ---------------------------------------------------------------------------
-# Config — nothing hardcoded. Set these as environment variables.
+# Config — ISE_HOST/ISE_USER/ISE_PASS are REQUIRED environment variables,
+# no defaults. A hardcoded fallback password here would mean this app
+# silently runs against a real ISE with a guessable credential if someone
+# forgets to set the env vars - refusing to start is the safer failure
+# mode. Set them before running (see module docstring above).
 # ---------------------------------------------------------------------------
-ISE_HOST = os.environ.get("ISE_HOST", "https://10.6.1.90")
-ISE_USER = os.environ.get("ISE_USER", "Dev")
-ISE_PASS = os.environ.get("ISE_PASS", "Login@123")
+def _require_env(name: str) -> str:
+    val = os.environ.get(name)
+    if not val:
+        raise RuntimeError(
+            f"{name} is not set. This app requires ISE_HOST, ISE_USER, and ISE_PASS "
+            f"to be set as environment variables before starting (see the module "
+            f"docstring for the exact commands). Refusing to start with a missing "
+            f"or hardcoded default credential."
+        )
+    return val
+
+
+ISE_HOST = _require_env("ISE_HOST")
+ISE_USER = _require_env("ISE_USER")
+ISE_PASS = _require_env("ISE_PASS")
 VERIFY_TLS = os.environ.get("ISE_VERIFY_TLS", "false").lower() == "true"
 
 # Optional shared-secret header check for agent -> app calls. Leave unset
@@ -108,6 +124,19 @@ class ISEClient:
         data = self._get(f"/ers/config/endpoint?filter=mac.EQ.{mac}")
         resources = data.get("SearchResult", {}).get("resources", [])
         return resources[0]["id"] if resources else None
+
+    def check_ise_reachable(self) -> bool:
+        """A real, cheap reachability check — one small ERS call with a
+        short timeout, not a hardcoded True. Used by /health, which the
+        dashboard's System Health panel reads directly."""
+        try:
+            r = requests.get(
+                f"{self.base}/ers/config/endpoint?filter=mac.EQ.00:00:00:00:00:00&size=1",
+                auth=self.auth, headers=HEADERS, verify=self.verify, timeout=5,
+            )
+            return r.status_code < 500
+        except Exception:
+            return False
 
     def write_posture(self, mac: str, status: str, failed_checks: str):
         attrs = {
@@ -213,7 +242,7 @@ class ISEClient:
         }
 
 
-ise = ISEClient(ISE_HOST, ISE_USER, ISE_PASS, verify=VERIFY_TLS) if (ISE_HOST and ISE_USER and ISE_PASS) else None
+ise = ISEClient(ISE_HOST, ISE_USER, ISE_PASS, verify=VERIFY_TLS)
 
 
 # ---------------------------------------------------------------------------
@@ -221,13 +250,63 @@ ise = ISEClient(ISE_HOST, ISE_USER, ISE_PASS, verify=VERIFY_TLS) if (ISE_HOST an
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
+import sqlite3
+DB_FILE = os.environ.get("POSTURE_DB_FILE", "posture.db")
+
+def save_posture_to_db(mac, ip, hostname, os_name, os_version, status, detail, submitted, submit_error, checks, apps_count, listening_ports):
+    try:
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
+            conn.execute("PRAGMA foreign_keys = ON;")
+            conn.execute("PRAGMA journal_mode = WAL;")
+            cursor = conn.cursor()
+            
+            # 1. Update/Insert endpoint
+            cursor.execute("""
+                INSERT INTO endpoints (mac, ip, hostname, os, os_version, last_seen, first_seen, apps_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(mac) DO UPDATE SET
+                    ip = excluded.ip,
+                    hostname = excluded.hostname,
+                    os = COALESCE(excluded.os, endpoints.os),
+                    os_version = COALESCE(excluded.os_version, endpoints.os_version),
+                    last_seen = excluded.last_seen,
+                    apps_count = excluded.apps_count
+            """, (mac.upper(), ip, hostname, os_name, os_version, timestamp, timestamp, apps_count))
+            
+            # 2. Insert assessment
+            cursor.execute("""
+                INSERT INTO assessments (mac, ip, timestamp, status, detail, submitted, submit_error, apps_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (mac.upper(), ip, timestamp, status, detail, submitted, submit_error, apps_count))
+            assessment_id = cursor.lastrowid
+            
+            # 3. Insert checks
+            for c in checks:
+                cursor.execute("""
+                    INSERT INTO check_results (assessment_id, check_name, status, detail)
+                    VALUES (?, ?, ?, ?)
+                """, (assessment_id, c.get("Check"), c.get("Status"), c.get("Details")))
+                
+            # 4. Save ports if any
+            if listening_ports:
+                cursor.execute("DELETE FROM endpoint_ports WHERE mac = ?", (mac.upper(),))
+                for p in listening_ports:
+                    cursor.execute("""
+                        INSERT INTO endpoint_ports (mac, port, process, pid, timestamp)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (mac.upper(), p.get("port"), p.get("process"), p.get("pid"), timestamp))
+            conn.commit()
+    except Exception as e:
+        log.error("Failed to save posture result to SQLite: %s", e)
+
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "application": "Posture Application (POC)",
         "status": "UP",
-        "ise_configured": ise is not None,
+        "ise_configured": ise.check_ise_reachable(),
     })
 
 
@@ -235,9 +314,6 @@ def health():
 def receive_posture():
     if POSTURE_API_KEY and request.headers.get("X-API-Key") != POSTURE_API_KEY:
         return jsonify({"status": "ERROR", "message": "Invalid or missing API key"}), 401
-
-    if ise is None:
-        return jsonify({"status": "ERROR", "message": "Server not configured — set ISE_HOST/ISE_USER/ISE_PASS"}), 500
 
     data = request.get_json(silent=True)
     if not data:
@@ -248,8 +324,13 @@ def receive_posture():
 
     mac = endpoint.get("mac")
     hostname = endpoint.get("hostname")
+    os_name = endpoint.get("operating_system")
+    os_version = endpoint.get("os_version")
+    
     raw_status = posture.get("status")
     checks = posture.get("checks", [])
+    apps_count = posture.get("appsCount") or 0
+    listening_ports = posture.get("listening_ports") or []
 
     if not mac:
         return jsonify({"status": "ERROR", "message": "endpoint.mac is required"}), 400
@@ -258,9 +339,13 @@ def receive_posture():
 
     ise_status = STATUS_MAP[raw_status]
     failed = ", ".join(c.get("Check", "?") for c in checks if c.get("Status") != "COMPLIANT")
+    detail = checks[0].get("Details", raw_status) if checks else raw_status
 
     log.info("Received posture for %s (%s): %s | failed=%s", hostname, mac, raw_status, failed or "none")
 
+    submitted = True
+    submit_error = None
+    enforcement = None
     try:
         ise.write_posture(mac, ise_status, failed)
         if ENFORCEMENT_MODE == "anc":
@@ -270,14 +355,18 @@ def receive_posture():
     except requests.HTTPError as e:
         body = e.response.text if e.response is not None else ""
         log.error("ISE call failed for %s: %s | %s", mac, e, body)
+        submitted = False
+        submit_error = str(e)
+        save_posture_to_db(mac, request.remote_addr, hostname, os_name, os_version, raw_status, detail, submitted, submit_error, checks, apps_count, listening_ports)
         return jsonify({"status": "ERROR", "message": f"ISE API call failed: {e}"}), 502
     except Exception as e:
-        # Catches anything that isn't a plain HTTP error from ISE — bad/empty
-        # JSON in an ISE response, a connection or SSL problem, etc. — so the
-        # real cause shows up in the Postman response instead of a blank
-        # Flask 500 page. Full traceback still goes to the server log too.
         log.exception("Unexpected error handling posture for %s", mac)
+        submitted = False
+        submit_error = str(e)
+        save_posture_to_db(mac, request.remote_addr, hostname, os_name, os_version, raw_status, detail, submitted, submit_error, checks, apps_count, listening_ports)
         return jsonify({"status": "ERROR", "message": f"Unexpected server error: {e}"}), 500
+
+    save_posture_to_db(mac, request.remote_addr, hostname, os_name, os_version, raw_status, detail, submitted, submit_error, checks, apps_count, listening_ports)
 
     return jsonify({
         "status": "SUCCESS",
@@ -288,7 +377,5 @@ def receive_posture():
 
 
 if __name__ == "__main__":
-    if ise is None:
-        log.warning("ISE_HOST/ISE_USER/ISE_PASS not fully set — /api/v1/posture will return 500 until configured.")
     log.info("Listening on http://%s:%s", LISTEN_HOST, LISTEN_PORT)
     app.run(host=LISTEN_HOST, port=LISTEN_PORT, debug=False)
